@@ -22,7 +22,7 @@ import static bitwise.Nexus.*;
 
 @SuppressWarnings("serial")
 public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMotionListener, FocusListener, MouseWheelListener {
-	static double x, y, z, velX, velY, velZ, yaw, pitch, zoom = 125, sinYaw, sinPitch, cosYaw, cosPitch, amp = 1, flight = 0.1, sensitivity = Math.PI / 1800;
+	static double x, y, z, velX, velY, velZ, yaw, pitch, zoom = 125, fov = 0.02*Math.round(100*((180/Math.PI)*Math.atan((2*(350/zoom))/1.452))), sinYaw, sinPitch, cosYaw, cosPitch, amp = 1, flight = 0.1, sensitivity = Math.PI / 1800;
 	volatile static boolean vSync = true, caves = true, terrain3D = true, degrees, lock, focus, inside, update = true, sprint, fly, fill, display = true, classic = true, xor, sprintRequest, showFPS = true, showXYZ = true, showRot = true, showCyan = true, showMagenta = true, showExtra = true;
 	public static byte scale = 1, detail = 1, option, heldBlock, reach = 5, power = 3;
 	final static int SIZE = 64, SHIFT = 6, MASK = 63, VOL = SIZE * SIZE * SIZE, BLOCK_COUNT = 36, TEX_STRIDE = 16 * 16 * 3;
@@ -37,7 +37,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	final static int MAGIC = 0x4E585335; // save format id ("NXS5")
 	static final double[] PERLIN = new double[perlinRes + 1];
 	static volatile byte[] hotbar = new byte[]{};
-	public static String VERSION = "Bitwise Nexus 2.2";
+	public static String VERSION = "Bitwise Nexus 2.2.1";
 	volatile static String hoveredType;
 	static Vec3 light = new Vec3(0), sunColor = new Vec3(0), ambColor = new Vec3(0), skyColor = new Vec3(0);
 	static final Vec3 SUN_LOW = new Vec3(1, 0.5, 0), SUN_DAY = new Vec3(1), SUN_NIGHT = new Vec3(0.3, 0.3, 0.5);
@@ -228,21 +228,28 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		long bx = (long) Math.floor(viewX), by = (long) Math.floor(viewY), bz = (long) Math.floor(viewZ);
 		long top = topBound();
 		// Only the loaded window can contain a roof. Clamp the scan to it.
-		long scanTop = Math.max(top, (chunkOf(viewY) - Math.min(radius, 4)) * SIZE);
-		if (by <= scanTop) { caveTarget = 0; caveMix *= 0.96; return; } // nothing loaded above us
+		long scanTop = Math.max(top, (chunkOf(viewY) - radius) * SIZE);
+		// If the upper world boundary is not loaded yet, keep the last reliable
+		// target instead of briefly switching cave fog off while chunks stream in.
+		if (by <= scanTop) {
+			caveMix += (caveTarget - caveMix) * 0.04;
+			return;
+		}
 		if (bx != caveCheckX || by != caveCheckY || bz != caveCheckZ) {
 			caveCheckX = bx; caveCheckY = by; caveCheckZ = bz;
 			int roofBlocks = columnRoof(bx, by, bz, scanTop);
 			int coveredNeighbours = 0;
-			if (roofBlocks >= 20) {
-				for (int dx = -1; dx <= 1; dx++)
-					for (int dz = -1; dz <= 1; dz++) {
-						if (dx == 0 && dz == 0) continue;
-						if (columnRoof(bx + dx, by, bz + dz, scanTop) >= 20)
-							coveredNeighbours++;
-					}
-			}
-			caveTarget = roofBlocks >= 20 && coveredNeighbours >= 3 ? 1 : 0;
+			for (int dx = -1; dx <= 1; dx++)
+				for (int dz = -1; dz <= 1; dz++) {
+					if (dx == 0 && dz == 0) continue;
+					if (columnRoof(bx + dx, by, bz + dz, scanTop) >= 20)
+						coveredNeighbours++;
+				}
+			// Hysteresis prevents ledges and uneven roofs from toggling cave fog.
+			if (caveTarget < 0.5)
+				caveTarget = roofBlocks >= 20 && coveredNeighbours >= 5 ? 1 : 0;
+			else
+				caveTarget = roofBlocks >= 12 && coveredNeighbours >= 2 ? 1 : 0;
 		}
 		caveMix += (caveTarget - caveMix) * 0.04;
 	}
@@ -394,6 +401,12 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		double value = AUTO_ZOOM_BASE + (AUTO_ZOOM_REFERENCE - AUTO_ZOOM_BASE) * t;
 		value = Math.round(value / 5.0) * 5.0;
 		return Math.max(AUTO_ZOOM_MIN, Math.min(AUTO_ZOOM_MAX, value));
+	}
+
+	/** Update zoom and its corresponding horizontal field of view together. */
+	static void setZoom(double value) {
+		zoom = value;
+		fov = 0.02 * Math.round(100 * ((180 / Math.PI) * Math.atan((2 * (350 / zoom)) / 1.452)));
 	}
 
 	// ------------------------------------------------------------------ helpers
@@ -1606,9 +1619,10 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		}
 		case CB_SNOW: {
 			double band = mossBand(cy); // same Y range as moss
-			if (band <= 0 || noise(wx / 512.0, wz / 512.0) <= 1.4) // only under snowy biomes
-				return 0;
-			return band * smoothstep(0.5, 0.7, noise3(wx / 160.0, cy / 90.0, wz / 160.0, 0x4E));
+			if (band <= 0) return 0;
+			// Feather the snow-biome edge so fog does not pop at the 1.4 threshold.
+			double snowRegion = smoothstep(1.36, 1.44, noise(wx / 512.0, wz / 512.0));
+			return band * snowRegion * smoothstep(0.5, 0.7, noise3(wx / 160.0, cy / 90.0, wz / 160.0, 0x4E));
 		}
 		case CB_OBSIDIAN: return hardZone(wx, cy, wz, 0x4F, 80.0, 0.78, OBSIDIAN_MAX_Y); // rarer
 		case CB_CRYSTAL:  return hardZone(wx, cy, wz, 0x50, 120.0, 0.76, CRYSTAL_MAX_Y); // rarer
@@ -1617,10 +1631,11 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		return 0;
 	}
 
-	/** Same lookup for an arbitrary block position (snaps to the 4-block cell used by carveCaves). */
+	/** Fog biome weight sampled at voxel centres, not the coarser cave-carving grid.
+	 * Keeping the noise continuous here avoids visible 4x4x4 "sections" in fog.
+	 */
 	private static double zoneAt(int biome, long x, long y, long z) {
-		long s = CAVE_STEP;
-		return zoneWeight(biome, Math.floorDiv(x, s) * s, Math.floorDiv(y, s) * s + s / 2.0, Math.floorDiv(z, s) * s);
+		return zoneWeight(biome, x + 0.5, y + 0.5, z + 0.5);
 	}
 
 	private static boolean replaceable(int biome, byte cur) {
@@ -2726,7 +2741,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 			if (showCyan) {
 				g2d.setColor(Color.cyan);
 				ln(g2d, "Time: " + time);
-				ln(g2d, "Zoom: " + (short) zoom);
+				ln(g2d, "Zoom: " + (short) zoom + " (" + String.format(Locale.ROOT, "%.2f", fov) + "°)");
 				ln(g2d, "Render Distance: " + dist + " (" + radius + ")");
 			}
 			if (showMagenta) {
@@ -2867,7 +2882,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 			int y0 = settingsY0();
 			if (worldSettingsMenu) {
 				drawSlider(g,x0,y0,w,"Block reach",(reach-2)/48.0,Integer.toString(reach));
-				drawSlider(g,x0,y0+62,w,"Zoom",(Math.log(Math.max(10,Math.min(5000,zoom))/10.0)/Math.log(500)),Integer.toString((int)zoom));
+				drawSlider(g,x0,y0+62,w,"Zoom",(Math.log(Math.max(10,Math.min(5000,zoom))/10.0)/Math.log(500)),Integer.toString((int)zoom)+" (FOV: "+String.format(Locale.ROOT,"%.2f",fov)+"°)");
 				drawButton(g,new Rectangle(x0,y0+130,w,32),"Use Degrees for Rotation: "+(degrees?"ON":"OFF"));
 				drawButton(g,new Rectangle(x0,y0+168,w,32),"Cave Generation: "+(caves?"ON":"OFF"));
 				drawButton(g,new Rectangle(x0,y0+206,w,32),"3D Terrain: "+(terrain3D?"ON":"OFF"));
@@ -2949,7 +2964,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 			int x0=Math.max(24,width/2-210), w=Math.min(420,width-48), y0=settingsY0();
 			if (worldSettingsMenu) {
 				if (my>=y0+18&&my<=y0+42) reach=(byte)(2+Math.round(Math.max(0,Math.min(1,(mx-x0)/(double)w))*48));
-				else if(my>=y0+80&&my<=y0+104) zoom=10*Math.pow(500,Math.max(0,Math.min(1,(mx-x0)/(double)w)));
+				else if(my>=y0+80&&my<=y0+104) setZoom(10*Math.pow(500,Math.max(0,Math.min(1,(mx-x0)/(double)w))));
 				else if(my>=y0+130&&my<=y0+162) degrees=!degrees;
 				else if(my>=y0+168&&my<=y0+200) { caves=!caves; resetGeneratedWorld(); }
 				else if(my>=y0+206&&my<=y0+238) { terrain3D=!terrain3D; resetGeneratedWorld(); }
@@ -2995,7 +3010,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		my = (int)Math.round(height / 2.0 + (my - height / 2.0) / s);
 		int x0=Math.max(24,width/2-210), w=Math.min(420,width-48);
 		if (worldSettingsMenu && menuSliderTarget == 5) { reach=(byte)(2+Math.round(Math.max(0,Math.min(1,(mx-x0)/(double)w))*48));
-		} else if (worldSettingsMenu && menuSliderTarget == 6) { zoom=10*Math.pow(500,Math.max(0,Math.min(1,(mx-x0)/(double)w)));
+		} else if (worldSettingsMenu && menuSliderTarget == 6) { setZoom(10*Math.pow(500,Math.max(0,Math.min(1,(mx-x0)/(double)w))));
 		} else if (menuSliderTarget == 0) {
 			double t=Math.max(0,Math.min(1,(mx-x0)/(double)w)); flight=.01*Math.pow(1000,t);
 		} else if (menuSliderTarget == 1) {
@@ -3043,7 +3058,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		if (wd != zoomWidth) {
 			zoomWidth = wd;
 			scale = (byte) autoGuiScale(wd);
-			zoom = autoZoom(wd);
+			setZoom(autoZoom(wd));
 		}
 		int newResX = Math.max(1, (int) ((width / 8.0) * Math.pow(2, detail)));
 		int newResY = Math.max(1, (int) ((height / 8.0) * Math.pow(2, detail)));
@@ -4452,7 +4467,7 @@ final class Vec3 {
 
 final class Fog {
 	double r, g, b, dens; // result of the last at()
-	private static final int N = 512;
+	private static final int N = 2048;
 	// rgb + density: none, moss, snow, obsidian, crystal, basalt (indexed by CB_*)
 	private static final double[][] CAVE = {
 		{ .03, .04, .06, 2.4 }, { .10, .34, .14, 2.0 }, { .45, .65, .90, 1.6 }, { .17, .06, .28, 2.4 }, { .03, .04, .06, 2.4 }, { .10, .08, .07, 2.8 } };
@@ -4460,6 +4475,7 @@ final class Fog {
 	private final long[] keys = new long[N];
 	private final double[][] cache = new double[N][4];
 	private double sr, sg, sb, sd;
+	private final double[] caveBlend = new double[4];
 	// Per-renderer cache of biome-noise lattice samples. Interpolation keeps the
 	// tint continuous while avoiding a full noise evaluation for every pixel.
 	private static final int BIOME_CACHE_SIZE = 1024;
@@ -4501,12 +4517,11 @@ final class Fog {
 		sd = dry * 1.0 + plain * 1.0 + snow * 1.3 + ice * 1.7;
 	}
 
-	private double[] cave(long x, long y, long z) {
-		// Cache at 1x1x1 world-voxel resolution instead of 8x8x8. This removes
-		// visible blocky fog boundaries while still reusing samples for pixels
-		// that look through the same voxel.
+	private double[] caveVoxel(long x, long y, long z) {
+		// Cache biome fog once per voxel, then interpolate between voxel centres
+		// in cave() so rendered fog has no hard voxel-shaped colour boundaries.
 		long k = World.key(x, y, z);
-		int i = (int) ((k * 0x9E3779B97F4A7C15L) >>> 55);
+		int i = (int) ((k * 0x9E3779B97F4A7C15L) >>> 53);
 		double[] c = cache[i];
 		if (keys[i] != k) {
 			keys[i] = k;
@@ -4517,8 +4532,6 @@ final class Fog {
 					for (int j = 0; j < 4; j++)
 						c[j] += (CAVE[b][j] - c[j]) * w;
 			}
-			// Feather basin fog smoothly into nearby cave fog, evaluated per voxel
-			// so the edge is not quantized into 8x8x8 blocks.
 			int basinBiome = Nexus.basinFogBiome(x, y, z);
 			if (basinBiome != CB_NONE) {
 				double w = Nexus.basinFogWeight(x, y, z);
@@ -4529,13 +4542,30 @@ final class Fog {
 		return c;
 	}
 
+	/** Trilinear interpolation makes fog transitions continuous between voxel centres. */
+	private double[] cave(double wx, double wy, double wz) {
+		double gx = wx - 0.5, gy = wy - 0.5, gz = wz - 0.5;
+		long x0 = (long) Math.floor(gx), y0 = (long) Math.floor(gy), z0 = (long) Math.floor(gz);
+		double fx = gx - x0, fy = gy - y0, fz = gz - z0;
+		double[] out = caveBlend;
+		Arrays.fill(out, 0.0);
+		for (int dx = 0; dx <= 1; dx++)
+			for (int dy = 0; dy <= 1; dy++)
+				for (int dz = 0; dz <= 1; dz++) {
+				double w = (dx == 0 ? 1 - fx : fx) * (dy == 0 ? 1 - fy : fy) * (dz == 0 ? 1 - fz : fz);
+				double[] v = caveVoxel(x0 + dx, y0 + dy, z0 + dz);
+				for (int j = 0; j < 4; j++) out[j] += v[j] * w;
+				}
+		return out;
+	}
+
 	/** Fog colour and density at a world position. */
 	void at(double wx, double wy, double wz) {
 		surface(wx, wz);
 		r = sr * Render.fLR; g = sg * Render.fLG; b = sb * Render.fLB; dens = sd;
 		double c = Render.cave;
 		if (c > 0.002) {
-			double[] k = cave((long) Math.floor(wx), (long) Math.floor(wy), (long) Math.floor(wz));
+			double[] k = cave(wx, wy, wz);
 			r += (k[0] - r) * c; g += (k[1] - g) * c; b += (k[2] - b) * c; dens += (k[3] - dens) * c;
 		}
 	}
