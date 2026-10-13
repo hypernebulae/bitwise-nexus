@@ -37,7 +37,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	final static int MAGIC = 0x4E585335; // save format id ("NXS5")
 	static final double[] PERLIN = new double[perlinRes + 1];
 	static volatile byte[] hotbar = new byte[]{};
-	public static String VERSION = "Bitwise Nexus 2.2.1";
+	public static String VERSION = "Bitwise Nexus 2.2.2";
 	volatile static String hoveredType;
 	static Vec3 light = new Vec3(0), sunColor = new Vec3(0), ambColor = new Vec3(0), skyColor = new Vec3(0);
 	static final Vec3 SUN_LOW = new Vec3(1, 0.5, 0), SUN_DAY = new Vec3(1), SUN_NIGHT = new Vec3(0.3, 0.3, 0.5);
@@ -2770,7 +2770,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 			}
 		} else if (option == 2 && controlsUIEnabled) {
 			g2d.setColor(Color.white);
-			ln(g2d, VERSION + ", made on October 12, 2026");
+			ln(g2d, VERSION + ", made on October 13, 2026");
 			g2d.setColor(Color.red);
 			ln(g2d, "Interface controls: F1 to hide all, F3 toggles HUD, F4 toggles controls HUD");
 			g2d.setColor(Color.yellow);
@@ -2815,7 +2815,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 			g2d.drawImage(crosshair, width / 2 - CROSS / 2, height / 2 - CROSS / 2, null);
 			gui(g2d);
 		}
-		if (paused && !hideEverything) {
+		if (paused) {
 			Graphics2D menuGraphics = (Graphics2D) g2d.create();
 			menuGraphics.translate(width / 2.0, height / 2.0);
 			menuGraphics.scale(Math.max(1, scale), Math.max(1, scale));
