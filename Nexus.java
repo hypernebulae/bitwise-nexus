@@ -36,10 +36,10 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	volatile static int dirX, dirY, dirZ, newDirX, newDirY, newDirZ;
 	static long activity = System.currentTimeMillis(), time, fps, frames, x0 = NO_POS, y0 = NO_POS, z0 = NO_POS, x1 = NO_POS, y1 = NO_POS, z1 = NO_POS, fpsTime = System.currentTimeMillis();
 	final static byte BLOCK_COUNT = 46, AXIS_X = 0, AXIS_Y = 1, AXIS_Z = 2, CROSS = 32, perlinRes = 127;
-	final static int MAGIC = 0x4E585335; // save format id ("NXS5")
+	final static int MAGIC = 0x4E585336; // save format id ("NXS6")
 	static final double[] PERLIN = new double[perlinRes + 1];
 	static volatile byte[] hotbar = new byte[]{};
-	public static String VERSION = "Bitwise Nexus 2.3";
+	public static String VERSION = "Bitwise Nexus 2.4";
 	volatile static String hoveredType;
 	static Vec3 light = new Vec3(0), sunColor = new Vec3(0), ambColor = new Vec3(0), skyColor = new Vec3(0);
 	static final Vec3 SUN_LOW = new Vec3(1, 0.5, 0), SUN_DAY = new Vec3(1), SUN_NIGHT = new Vec3(0.3, 0.3, 0.5);
@@ -51,7 +51,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	static String[] modifyValues = new String[6];
 	static int modifyFocus = 0, modifyCaret = 0, modifyAnchor = 0;
 	static volatile boolean settingsMenu = false, extraSettingsMenu = false, quitConfirm = false, amplitudeConfirm = false;
-	static volatile boolean hideEverything = false, guiEnabled = true, controlsUIEnabled = true;
+	static volatile boolean hideEverything = false, guiEnabled = false, controlsUIEnabled = false;
 	static volatile double pendingAmplitude = 1;
 	static volatile boolean musicEnabled = true;
 	static volatile double soundVolume = 1.0, musicVolume = 1.0;
@@ -82,12 +82,39 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	static final DecimalFormat FMT3 = new DecimalFormat("0.###"), FMT1 = new DecimalFormat("0.#\u00B0");
 	static Font guiFont;
 	static int guiFontScale = -1;
+	/** Unloaded chunks the player never edited are kept here and evicted oldest-first. 0 = no limit on that axis. */
+	static int CACHE_MAX_CHUNKS = 8192;
+	static long CACHE_MAX_BYTES = 128L << 20;
+	/** A teleport longer than this many render radii drops and reloads every chunk. 0 = reload on every teleport. */
+	static double TELEPORT_RELOAD_RADII = 1.0;
+	/** Shadow sub-cells per block (16 = one per texel). 0 = exact per-pixel shadow rays, no cache. */
+	static int SHADOW_GRID = 16;
+	/** Sun direction used for shadow rays is refreshed this often (ticks, 100/s). 0 = every frame (exact, but no cross-frame reuse). */
+	static int SHADOW_REFRESH_TICKS = 10;
+	/** Shadow cells coarsen with distance until they are about this fraction of a rendered pixel. 0 = off. Higher = coarser/faster. */
+	static double SHADOW_LOD = 0.5;
+	/** Faces fogged beyond this fraction skip AO/shadow/skylight. 1.0 = never skip. */
+	static double FOG_SKIP = 0.97;
+	/** Bumped whenever blocks or loaded chunks change; render caches clear themselves when it moves. */
+	static int worldVer;
+	/** Shared ambient-occlusion strength for Classic and Modern; zero bypasses AO sampling. */
+	static volatile double AO_STRENGTH = 0.6;
+	static final LinkedHashMap<Long, Object> chunkCache = new LinkedHashMap<>();
+	static volatile long cacheBytes;
+	static boolean generating;
+	static volatile boolean[] OPAQUE = new boolean[256];
 	final static ExecutorService pool = Executors.newFixedThreadPool(RENDER_THREADS, r -> {
 		Thread t = new Thread(r, "nexus-worker");
 		t.setDaemon(true);
 		return t;
 	});
 
+	static final ExecutorService savePool = Executors.newSingleThreadExecutor(r -> { Thread t = new Thread(r, "nexus-save"); t.setDaemon(true); return t; });
+	static final AtomicBoolean saveInProgress = new AtomicBoolean(false);
+	static volatile boolean saveRequested;
+	static volatile File requestedSaveFile;
+	static final Object SAVE_LOCK = new Object();
+	static volatile boolean shutdownSaveStarted;
 	static final ExecutorService genPool = Executors.newFixedThreadPool(Math.max(1, THREADS - 1), r -> {
 		Thread t = new Thread(r, "nexus-gen");
 		t.setDaemon(true);
@@ -97,12 +124,16 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 
 	static final class GenBatch {
 		final long[][] coords;
-		final List<Future<byte[]>> futures;
+		final List<Future<Octree>> futures;
+		final boolean[] runFeatures;
+		final boolean[] cachedRestore;
 		final int epoch;
-		GenBatch(long[][] coords, List<Future<byte[]>> futures, int epoch) {
-			this.coords = coords; this.futures = futures; this.epoch = epoch;
+		GenBatch(long[][] coords, List<Future<Octree>> futures, boolean[] runFeatures, boolean[] cachedRestore, int epoch) {
+			this.coords = coords; this.futures = futures; this.runFeatures = runFeatures;
+			this.cachedRestore = cachedRestore; this.epoch = epoch;
 		}
 	}
+
 	static GenBatch inFlight;
 	static final ArrayDeque<long[]> featureQueue = new ArrayDeque<>();
 	static int featureEpoch;
@@ -114,11 +145,9 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	static final int AUTO_ZOOM_REFERENCE_WIDTH = 2880;
 	static final double AUTO_ZOOM_BASE = 90;
 	static final double AUTO_ZOOM_REFERENCE = 250;
-	static final Map<Long, Long> chunkLastSeen = new HashMap<>();
 	static long lastChunkCleanup;
 	static double red = 0.3, green = 0.4, blue = 0.5;
 	static volatile boolean toggleFullscreenRequested;
-	static final Map<Long, byte[]> savedChunks = new HashMap<>();
 	static final byte[] EMPTY = new byte[0];
 	static final String[] NAMES = new String[BLOCK_COUNT];
 	static final Color HOTBAR_BG = new Color(0x33, 0x33, 0x33, 0x7F).darker(), HOTBAR_BORDER = Color.gray.darker();
@@ -132,11 +161,20 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 			OBSIDIAN = 23, CLAY = 24, GRAVEL = 25, OAK_PLANKS = 26, IRON = 27, COAL = 28, ASH = 29, CHECKERBOARD = 30,
 			MOSS = 31, TANZANITE = 32, RHODONITE = 33, BASALT = 34, MARBLE = 35, BIRCH_LOG = 36, BIRCH_PLANKS = 37,
 			RED_LEAVES = 38, ORANGE_LEAVES = 39, YELLOW_LEAVES = 40, AUTUMN_GRASS = 41, TILE = 42, GOLD = 43, GOLD_ORE = 44, DIAMOND = 45;
-	static volatile int lightQ = 2;   // 0 basic, 1 AO + glow, 2 AO + skylight + lantern
-	static final String[] LIGHT_NAMES = { "Basic", "AO + Glow", "AO + Skylight + Lantern" };
+	static volatile int lightQ = 2;   // 0 basic, 1 AO + glow, 2 AO + skylight
+	static volatile boolean lanternEnabled = false;
+	static final String[] LIGHT_NAMES = { "Basic", "AO + Glow", "AO + Skylight" };
 	static double caveMix;            // 0 = outside, 1 = deep underground (smoothed)
 	static final float[] GLOW = glow();
-	static final byte[] ZERO = new byte[VOL];
+	static final Map<Long, Object> savedChunks = new HashMap<>();
+	/** When enabled, every chunk is retained in the active .nexus save and restored before regeneration. */
+	static volatile boolean persistentStorage = false;
+	static volatile File activeSaveFile;
+	static long lastPersistentSave;
+	static final byte[] DENSE_TMP = new byte[VOL]; // main thread only
+	private static final ThreadLocal<byte[]> GEN_DENSE = ThreadLocal.withInitial(() -> new byte[VOL]);
+	private static int[] loadOrder;
+	private static int loadOrderR = -1;
 	static final byte[][] PAGES = {
 		{ GRASS, DIRT, STONE, BRICKS, OAK_LOG, LEAVES, GLASS, SLATE, OAK_PLANKS },
 		{ DYNAMITE, TOPAZ, EMERALD, ICE, TANZANITE, RHODONITE, SNOW, SAND, ASH },
@@ -190,6 +228,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	}
 
 	public static void main(String[] args) {
+		Runtime.getRuntime().addShutdownHook(new Thread(Nexus::saveOnShutdown, "nexus-shutdown-save"));
 		frame = new JFrame(VERSION);
 		Nexus nexus = new Nexus();
 		frame.setSize(width, height);
@@ -213,6 +252,12 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		frame.getContentPane().add(nexus);
 		frame.setVisible(true);
 		nexus.run();
+	}
+
+	private static byte[] denseBuf() {
+		byte[] b = GEN_DENSE.get();
+		Arrays.fill(b, (byte) 0);
+		return b;
 	}
 
 	static boolean isLeaves(byte b) {
@@ -392,8 +437,47 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		return n != null ? n : "Block " + block;
 	}
 
-	static void stash(long key, byte[] data) {
-		savedChunks.put(key, data == null ? EMPTY : encode(data));
+	private static long sizeOf(Object o) {
+		return (o instanceof Octree ? ((Octree) o).memoryBytes() : ((byte[]) o).length + 16) + 64; // + map entry
+	}
+
+	static void clearSaved() {
+		savedChunks.clear();
+		chunkCache.clear();
+		cacheBytes = 0;
+	}
+
+	/** Evict oldest regenerable chunks until both limits are satisfied. Safe to call any time (main thread). */
+	static void evictCache() {
+		int maxN = CACHE_MAX_CHUNKS;
+		long maxB = CACHE_MAX_BYTES;
+		if (maxN <= 0 && maxB <= 0)
+			return;
+		Iterator<Map.Entry<Long, Object>> it = chunkCache.entrySet().iterator();
+		while (it.hasNext() && ((maxN > 0 && chunkCache.size() > maxN) || (maxB > 0 && cacheBytes > maxB))) {
+			cacheBytes -= sizeOf(it.next().getValue());
+			it.remove();
+		}
+	}
+
+	static void stash(long key, Octree data, boolean user) {
+		Object v;
+		if (data == null) {
+			v = EMPTY;
+		} else {
+			data.compact();
+			v = data;
+		}
+		Object old = chunkCache.remove(key);
+		if (old != null)
+			cacheBytes -= sizeOf(old);
+		if (user || savedChunks.containsKey(key)) { // player-edited: permanent
+			savedChunks.put(key, v);
+			return;
+		}
+		chunkCache.put(key, v); // re-inserted at the newest end
+		cacheBytes += sizeOf(v);
+		evictCache();
 	}
 
 	/** Persist (if edited) and unload one ring slot. */
@@ -401,20 +485,60 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		long k = world.keys[s];
 		if (k == World.NONE)
 			return;
-		if (world.dirty[s])
-			stash(k, world.data[s]);
+		// Only retain chunks that contain player-made block changes.
+		if (world.user[s])
+			stash(k, world.data[s], true);
 		world.keys[s] = World.NONE;
+		worldVer++;
 		world.data[s] = null;
 		world.dirty[s] = false;
+		world.user[s] = false;
 	}
 
-	/** Copy every edited live chunk into savedChunks (before clear/resize/save). */
+	/** Keep player edits across a clear/resize/save. Generation-only edits are simply regenerated. */
 	static void flushDirty() {
 		for (int s = 0; s < world.keys.length; s++)
-			if (world.keys[s] != World.NONE && world.dirty[s]) {
-				stash(world.keys[s], world.data[s]);
+			if (world.keys[s] != World.NONE && world.dirty[s] && world.user[s]) {
+				stash(world.keys[s], world.data[s], true);
 				world.dirty[s] = false;
 			}
+	}
+
+	/** Cold-storage entry (Octree, or RLE bytes from a file) back to a live chunk. */
+	static Octree restore(Object saved) {
+		if (saved instanceof Octree)
+			return (Octree) saved;
+		byte[] b = (byte[]) saved;
+		return b.length == 0 ? null : Octree.build(decodeInto(b, GEN_DENSE.get()));
+	}
+
+	/** Only used when writing a save file. */
+	static byte[] blobOf(Object o) {
+		if (o instanceof byte[])
+			return (byte[]) o;
+		byte[] dense = new byte[VOL];
+		((Octree) o).toDense(dense);
+		return encode(dense);
+	}
+
+	static byte[] decodeInto(byte[] data, byte[] out) {
+		Arrays.fill(out, (byte) 0);
+		int n = 0, i = 0;
+		while (i < data.length && n < VOL) {
+			byte v = data[i++];
+			int run = 0;
+			for (int shift = 0; i < data.length; shift += 7) {
+				int b = data[i++] & 0xFF;
+				run |= (b & 0x7F) << shift;
+				if (b < 0x80 || shift >= 21)
+					break;
+			}
+			int end = Math.min(VOL, n + run);
+			if (v != 0 && end > n)
+				Arrays.fill(out, n, end, v);
+			n = end;
+		}
+		return out;
 	}
 
 	static int autoGuiScale(int windowWidth) {
@@ -503,7 +627,6 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 			flushDirty();
 			radius = r;
 			world.resize(r);
-			chunkLastSeen.clear();
 		}
 		chunkDirty = true;
 	}
@@ -865,6 +988,20 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 				while ((task = tasks.poll()) != null)
 					task.run();
 
+				long autosaveNow = System.currentTimeMillis();
+				if (persistentStorage && activeSaveFile != null && autosaveNow - lastPersistentSave >= 30_000L) {
+					requestedSaveFile = activeSaveFile;
+					saveRequested = true;
+					lastPersistentSave = autosaveNow;
+				}
+				if (saveRequested && !saveInProgress.get()) {
+					File requested = requestedSaveFile != null ? requestedSaveFile : activeSaveFile;
+					if (requested != null) {
+						saveRequested = false;
+						doSave(requested);
+					}
+				}
+
 				if (paused || dialogOpen) {
 					// Keep menus/dialogs responsive while suspending simulation.
 					try { Thread.sleep(80); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
@@ -877,6 +1014,8 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 
 				ensureChunks();
 				cleanupOldChunks();
+				// Do not serialize the entire world on the simulation thread. Persistent
+				// chunks are retained in savedChunks as they unload and written on Save.
 				if (needGround) {
 					needGround = false;
 					y = groundY(x, z);
@@ -1139,15 +1278,26 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	static double groundY(double wx, double wz) {
 		long bx = (long) Math.floor(wx), bz = (long) Math.floor(wz);
 		long cy0 = chunkOf(y);
-		int vr = Math.min(radius, 4);
-		long start = Math.max(topBound(), (cy0 - vr) * SIZE);
-		long end = (cy0 + vr + 1) * SIZE;
-		for (long yy = start; yy < end; yy++) {
-			byte[] c = world.chunk(bx >> SHIFT, yy >> SHIFT, bz >> SHIFT);
+		long yy = Math.max(topBound(), (cy0 - radius) * SIZE);
+		long end = (cy0 + radius + 1) * SIZE;
+		while (yy < end) {
+			Octree c = world.chunk(bx >> SHIFT, yy >> SHIFT, bz >> SHIFT);
 			if (c == World.UNLOADED)
 				break;
-			if (getBlock(bx, yy, bz) != AIR)
+			if (c == null) { // empty chunk: jump to its far side
+				yy = ((yy >> SHIFT) + 1) << SHIFT;
+				continue;
+			}
+			int f = c.find((int) (bx & MASK), (int) (yy & MASK), (int) (bz & MASK));
+			if (f < 0) { // mixed 2x2x2 cell
+				if (c.get((int) (bx & MASK), (int) (yy & MASK), (int) (bz & MASK)) != AIR)
+					return yy - 1.54;
+				yy++;
+			} else if ((f & 0xFF) != AIR) {
 				return yy - 1.54;
+			} else {
+				yy = (yy | ((1L << (f >> 8)) - 1)) + 1; // skip the rest of this air cube
+			}
 		}
 		return estimateGround(bx, bz);
 	}
@@ -1256,30 +1406,21 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	}
 
 	private static void cleanupOldChunks() {
-	    long now = System.currentTimeMillis();
-	    if (now - lastChunkCleanup < 1000L)
-	        return;
-	    lastChunkCleanup = now;
-
-	    long cx = chunkOf(x), cy = chunkOf(y), cz = chunkOf(z);
-	    int r = radius;
-	    int verticalRadius = Math.min(r, 4);
-	    long cutoff = now - 10000;
-
-	    Iterator<Map.Entry<Long, Long>> it = chunkLastSeen.entrySet().iterator();
-	    while (it.hasNext()) {
-	        Map.Entry<Long, Long> entry = it.next();
-	        long[] c = World.decodeKey(entry.getKey());
-	        long dx = wrap21(c[0] - cx), dy = wrap21(c[1] - cy), dz = wrap21(c[2] - cz);
-	        c[0] = cx + dx; c[1] = cy + dy; c[2] = cz + dz;
-	        boolean inRange = dy >= -verticalRadius && dy <= verticalRadius && dx * dx + dz * dz <= (long) r * r;
-	        if (!inRange && entry.getValue() < cutoff) {
-	        	int s = world.slot(c[0], c[1], c[2]);
-	        	if (world.keys[s] == entry.getKey())
-	        		unloadSlot(s);
-	            it.remove();
-	        }
-	    }
+		long now = System.currentTimeMillis();
+		if (now - lastChunkCleanup < 1000L)
+			return;
+		lastChunkCleanup = now;
+		long cx = chunkOf(x), cy = chunkOf(y), cz = chunkOf(z);
+		long r2 = (long) radius * radius, cutoff = now - 10000;
+		for (int s = 0; s < world.keys.length; s++) {
+			long k = world.keys[s];
+			if (k == World.NONE || world.seen[s] >= cutoff)
+				continue;
+			long dx = wrap21(World.unpackX(k) - cx), dy = wrap21(World.unpackY(k) - cy), dz = wrap21(World.unpackZ(k) - cz);
+			if (dx * dx + dy * dy + dz * dz > r2)
+				unloadSlot(s);
+		}
+		evictCache();
 	}
 
 	private static void runFeatureQueue() {
@@ -1290,104 +1431,139 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		}
 		long end = System.nanoTime() + FEATURE_BUDGET_NS;
 		long[] m;
-		while ((m = featureQueue.poll()) != null) {
-			features(m[0], m[1], m[2]);
-			autumnForestFeatures(m[0], m[1], m[2]);
-			caveFeatures(m[0], m[1], m[2]);
-			basinFeatures(m[0], m[1], m[2]);
-			if (System.nanoTime() >= end)
-				break;
+		generating = true;
+		try {
+			while ((m = featureQueue.poll()) != null) {
+				features(m[0], m[1], m[2]);
+				autumnForestFeatures(m[0], m[1], m[2]);
+				caveFeatures(m[0], m[1], m[2]);
+				basinFeatures(m[0], m[1], m[2]);
+				if (System.nanoTime() >= end)
+					break;
+			}
+		} finally {
+			generating = false;
 		}
 	}
 
-	/** Installs a finished batch. Returns false while it is still generating. */
 	private static boolean collectBatch() {
 		GenBatch b = inFlight;
-		for (Future<byte[]> f : b.futures)
+		for (Future<Octree> f : b.futures)
 			if (!f.isDone())
 				return false;
 		inFlight = null;
 		chunkDirty = true;
 		if (b.epoch != world.epoch)
-			return true; // world was cleared/resized/loaded meanwhile: results are stale
+			return true;
 		if (featureEpoch != world.epoch) {
 			featureQueue.clear();
 			featureEpoch = world.epoch;
 		}
-		long now = System.currentTimeMillis();
+		long pcx = chunkOf(x), pcy = chunkOf(y), pcz = chunkOf(z), r2 = (long) radius * radius;
 		for (int i = 0; i < b.coords.length; i++) {
 			long[] m = b.coords[i];
-			byte[] d = null;
+			long dx = m[0] - pcx, dy = m[1] - pcy, dz = m[2] - pcz;
+			if (dx * dx + dy * dy + dz * dz > r2)
+				continue;
+			Octree d = null;
 			try {
 				d = b.futures.get(i).get();
 			} catch (Exception e) {
-				e.printStackTrace(); // treat a failed chunk as empty instead of retrying forever
+				e.printStackTrace();
 			}
-			unloadSlot(world.slot(m[0], m[1], m[2]));
+			int slot = world.slot(m[0], m[1], m[2]);
+			unloadSlot(slot);
 			world.put(m[0], m[1], m[2], d);
-			chunkLastSeen.put(World.key(m[0], m[1], m[2]), now);
-			featureQueue.add(m);
+			if (b.cachedRestore[i]) world.dirty[slot] = true;
+			if (b.runFeatures[i]) featureQueue.add(m);
 		}
 		return true;
+	}
+
+	/** Chunk offsets inside the load sphere, nearest first, packed as three biased bytes. */
+	private static int[] loadOrder(int r) {
+		if (r == loadOrderR)
+			return loadOrder;
+		int side = 2 * r + 1;
+		long[] tmp = new long[side * side * side];
+		int c = 0;
+		for (int dx = -r; dx <= r; dx++)
+			for (int dy = -r; dy <= r; dy++)
+				for (int dz = -r; dz <= r; dz++) {
+					int d2 = dx * dx + dy * dy + dz * dz;
+					if (d2 > r * r)
+						continue;
+					tmp[c++] = (long) d2 << 24 | ((dx + 128) | (dy + 128) << 8 | (dz + 128) << 16);
+				}
+		Arrays.sort(tmp, 0, c);
+		int[] o = new int[c];
+		for (int i = 0; i < c; i++)
+			o[i] = (int) (tmp[i] & 0xFFFFFF);
+		loadOrderR = r;
+		return loadOrder = o;
 	}
 
 	private static void ensureChunks() {
 		runFeatureQueue();
 		if (inFlight != null && !collectBatch())
-			return; // still generating in the background
+			return;
 
-		long cx = chunkOf(x);
-		long cy = chunkOf(y);
-		long cz = chunkOf(z);
-
+		long cx = chunkOf(x), cy = chunkOf(y), cz = chunkOf(z);
 		if (!chunkDirty && cx == lcx && cy == lcy && cz == lcz)
 			return;
-
 		chunkDirty = false;
-		lcx = cx;
-		lcy = cy;
-		lcz = cz;
+		lcx = cx; lcy = cy; lcz = cz;
 
-		int r = radius;
-		int verticalRadius = Math.min(r, 4);
-
-		List<long[]> pending = new ArrayList<>();
-		for (int dx = -r; dx <= r; dx++)
-			for (int dz = -r; dz <= r; dz++) {
-				if (dx * dx + dz * dz > r * r)
-					continue;
-				for (int dy = -verticalRadius; dy <= verticalRadius; dy++)
-					if (!world.has(cx + dx, cy + dy, cz + dz))
-						pending.add(new long[] { cx + dx, cy + dy, cz + dz });
+		int[] order = loadOrder(radius);
+		int[] picked = new int[MAX_LOAD_PER_PASS];
+		int n = 0;
+		for (int i = 0; i < order.length; i++) {
+			int o = order[i];
+			if (world.has(cx + (o & 255) - 128, cy + ((o >> 8) & 255) - 128, cz + ((o >> 16) & 255) - 128))
+				continue;
+			if (n == MAX_LOAD_PER_PASS) {
+				chunkDirty = true;
+				break;
 			}
-		if (pending.isEmpty())
-			return;
-
-		pending.sort(Comparator.comparingLong(p -> {
-			long a = p[0] - cx, b = p[1] - cy, c = p[2] - cz;
-			return a * a + b * b + c * c;
-		}));
-		int n = Math.min(pending.size(), MAX_LOAD_PER_PASS);
-		if (pending.size() > n)
-			chunkDirty = true; // more to load after this batch
-
-		List<long[]> missing = new ArrayList<>();
-		for (int i = 0; i < n; i++) {
-			long[] p = pending.get(i);
-			byte[] saved = savedChunks.get(World.key(p[0], p[1], p[2]));
-			if (saved != null) {
-				unloadSlot(world.slot(p[0], p[1], p[2]));
-				world.put(p[0], p[1], p[2], saved.length == 0 ? null : decode(saved));
-			} else
-				missing.add(p);
+			picked[n++] = o;
 		}
-		if (missing.isEmpty())
+		if (n == 0)
 			return;
 
-		List<Future<byte[]>> futures = new ArrayList<>(missing.size());
-		for (long[] m : missing)
-			futures.add(genPool.submit(() -> generate(m[0], m[1], m[2])));
-		inFlight = new GenBatch(missing.toArray(new long[0][]), futures, world.epoch);
+		List<long[]> batchCoords = new ArrayList<>(n);
+		List<Future<Octree>> futures = new ArrayList<>(n);
+		List<Boolean> featureFlags = new ArrayList<>(n);
+		List<Boolean> cacheFlags = new ArrayList<>(n);
+		for (int i = 0; i < n; i++) {
+			int o = picked[i];
+			long qx = cx + (o & 255) - 128, qy = cy + ((o >> 8) & 255) - 128, qz = cz + ((o >> 16) & 255) - 128;
+			long key = World.key(qx, qy, qz);
+			Object saved = savedChunks.get(key);
+			boolean cached = false;
+			if (saved == null && (saved = chunkCache.remove(key)) != null) {
+				cacheBytes -= sizeOf(saved);
+				cached = true;
+			}
+			final Object restoreValue = saved;
+			final long[] coord = new long[] { qx, qy, qz };
+			batchCoords.add(coord);
+			if (restoreValue != null) {
+				futures.add(genPool.submit(() -> restore(restoreValue)));
+				featureFlags.add(false);
+				cacheFlags.add(cached);
+			} else {
+				futures.add(genPool.submit(() -> generate(coord[0], coord[1], coord[2])));
+				featureFlags.add(true);
+				cacheFlags.add(false);
+			}
+		}
+		boolean[] featurePass = new boolean[batchCoords.size()];
+		boolean[] cacheRestore = new boolean[batchCoords.size()];
+		for (int i = 0; i < batchCoords.size(); i++) {
+			featurePass[i] = featureFlags.get(i);
+			cacheRestore[i] = cacheFlags.get(i);
+		}
+		inFlight = new GenBatch(batchCoords.toArray(new long[0][]), futures, featurePass, cacheRestore, world.epoch);
 	}
 
 	static final double TBASE = 160, TDIV = 24, TK = 10;
@@ -1438,18 +1614,16 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		return t * t * (3.0 - 2.0 * t);
 	}
 
-	private static byte[] generate(long cx, long cy, long cz) {
+	private static Octree generate(long cx, long cy, long cz) {
 		byte[] data = terrain3D ? generate3D(cx, cy, cz) : generate2D(cx, cy, cz);
-		if (data != null) {
-			if (caves) {
-				carveCaves(data, cx, cy, cz);
-				carveBasins(data, cx, cy, cz);
-			}
-			placeOres(data, cx, cy, cz);
-			if (Arrays.equals(data, ZERO))
-			    return null;
+		if (data == null)
+			return null;
+		if (caves) {
+			carveCaves(data, cx, cy, cz);
+			carveBasins(data, cx, cy, cz);
 		}
-		return data;
+		placeOres(data, cx, cy, cz);
+		return Octree.build(data);
 	}
 
 	/**
@@ -1476,16 +1650,16 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		}
 		byte[] data = null;
 		float[] col = GEN_COL.get();
-		for (int lz = 0; lz < SIZE; lz++) {
+		for (byte lz = 0; lz < SIZE; lz++) {
 			int kz = lz >> 2;
 			float fz = (lz & 3) * 0.25f;
 			long wz = baseZ + lz;
-			for (int lx = 0; lx < SIZE; lx++) {
+			for (byte lx = 0; lx < SIZE; lx++) {
 				int kx = lx >> 2;
 				float fx = (lx & 3) * 0.25f;
 				int base = kz * nyn + kx;
 				boolean any = false;
-				for (int gy = 0; gy < ny; gy++) {
+				for (byte gy = 0; gy < ny; gy++) {
 					int i = base + gy * n;
 					float a = g[i] + fx * (g[i + 1] - g[i]);
 					float b = g[i + nyn] + fx * (g[i + nyn + 1] - g[i + nyn]);
@@ -1497,7 +1671,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 				boolean biomeSet = false;
 				byte top = GRASS, sub = DIRT;
 				int run = 0; // solid voxels since the last air voxel above
-				for (int ly = -8; ly < SIZE; ly++) {
+				for (byte ly = -8; ly < SIZE; ly++) {
 					int t = ly + 8, cell = t >> 2;
 					float d = col[cell] + (t & 3) * 0.25f * (col[cell + 1] - col[cell]);
 					if (d <= 0) {
@@ -1527,7 +1701,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 						block = layerBlock(baseY + ly - TBASE, b1, b2, (int) (baseX + lx), (int) (baseY + ly), (int) wz);
 					}
 					if (data == null)
-						data = new byte[VOL];
+						data = denseBuf();
 					data[lx | (ly << SHIFT) | (lz << 2 * SHIFT)] = block;
 				}
 			}
@@ -1571,7 +1745,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 					else if (depth <= 4) block = sub;
 					else block = layerBlock(depth, b1, b2, (int) wx, (int) (baseY + ly), (int) wz);
 					if (data == null)
-						data = new byte[VOL];
+						data = denseBuf();
 					data[lx | (ly << SHIFT) | (lz << 2 * SHIFT)] = block;
 				}
 			}
@@ -1929,7 +2103,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		long baseX = cx * SIZE, baseY = cy * SIZE, baseZ = cz * SIZE;
 		boolean snowY = baseY + SIZE > MOSS_Y0 && baseY < MOSS_Y3;
 		boolean magmaY = baseY + SIZE > TBASE + LAYER2 - 300;
-		byte[] d = world.chunk(cx, cy, cz);
+		Octree d = world.chunk(cx, cy, cz);
 		if ((!snowY && !magmaY) || d == null || d == World.UNLOADED)
 			return;
 		Random r = new Random(World.key(cx, cy, cz) ^ 0x1C1C1EL);
@@ -2259,7 +2433,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 
 	private static void autumnForestFeatures(long cx, long cy, long cz) {
 		long baseX = cx * SIZE, baseY = cy * SIZE, baseZ = cz * SIZE;
-		byte[] d = world.chunk(cx, cy, cz);
+		Octree d = world.chunk(cx, cy, cz);
 		if (d == null || d == World.UNLOADED)
 			return;
 
@@ -2394,11 +2568,9 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 				if (r.nextInt(6) == 0) {
 					long tx = wx + r.nextInt(32) - 16;
 					long tz = wz + r.nextInt(32) - 16;
-                    // Keep the entire canopy inside the owning chunk column so foliage
-                    // is generated together instead of being clipped at chunk borders.
-                    long localX = tx & MASK, localZ = tz & MASK;
-                    if (localX < 4 || localX >= SIZE - 4 || localZ < 4 || localZ >= SIZE - 4)
-                        continue;
+                    // Trees may cross chunk borders. setBlock writes into any already-loaded
+                    // neighbour chunk, so don't discard valid trees just because their canopy
+                    // extends beyond the chunk that selected the tree.
 					int th = 4 + r.nextInt(2);
 					double val = noise(tx / 512.0, tz / 512.0);
 					if (val < 0.7 || val > 1.35)
@@ -2462,10 +2634,10 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	// ------------------------------------------------------------------ block access
 
 	static byte getBlock(long x, long y, long z) {
-		byte[] c = world.chunk(x >> SHIFT, y >> SHIFT, z >> SHIFT);
+		Octree c = world.chunk(x >> SHIFT, y >> SHIFT, z >> SHIFT);
 		if (c == null || c == World.UNLOADED)
 			return AIR;
-		return c[(int) (x & MASK) | ((int) (y & MASK) << SHIFT) | ((int) (z & MASK) << 2 * SHIFT)];
+		return c.get((int) (x & MASK), (int) (y & MASK), (int) (z & MASK));
 	}
 
 	static void setBlock(long x, long y, long z, byte block) {
@@ -2473,17 +2645,24 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		int s = world.slot(cx, cy, cz);
 		if (world.keys[s] != World.key(cx, cy, cz))
 			return;
-		byte[] c = world.data[s];
+		Octree c = world.data[s];
 		if (c == null) {
 			if (block == AIR)
 				return;
-			c = world.data[s] = new byte[VOL];
+			c = world.data[s] = new Octree(64);
+		} else if (c.shared) {
+			if (c.root == (Octree.LEAF | (block & 0xFF)))
+				return;
+			c = world.data[s] = c.copy();
 		}
-		int index = (int) (x & MASK) | ((int) (y & MASK) << SHIFT) | ((int) (z & MASK) << (2 * SHIFT));
-		if (c[index] == block)
+		if (!c.set((int) (x & MASK), (int) (y & MASK), (int) (z & MASK), block))
 			return;
-		c[index] = block;
+		worldVer++;
 		world.dirty[s] = true;
+		if (!generating)
+			world.user[s] = true;
+		if (c.isEmpty())
+			world.data[s] = null;
 	}
 
 	private static void fill(byte block, long x0, long y0, long z0, long x1, long y1, long z1, boolean replace) {
@@ -2816,6 +2995,20 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 				}
 			}
 		}
+		computeOpaque();
+	}
+
+	/** A block is "opaque" if none of its 768 atlas texels is transparent: a shadow ray that enters it always stops. */
+	static void computeOpaque() {
+		boolean[] o = new boolean[256];
+		for (int id = 1; id < BLOCK_COUNT; id++) {
+			boolean all = true;
+			for (int i = 0; i < 768 && all; i++)
+				if ((atlas[id * 768 + i] & 0xFFFFFF) == 0)
+					all = false;
+			o[id] = all;
+		}
+		OPAQUE = o;
 	}
 
 	private static int triangleTint(int x, int y) {
@@ -3089,7 +3282,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 			}
 		} else if (option == 2 && controlsUIEnabled) {
 			g2d.setColor(Color.white);
-			ln(g2d, VERSION + ", made on October 17, 2026");
+			ln(g2d, VERSION + ", made on October 19, 2026");
 			g2d.setColor(Color.red);
 			ln(g2d, "Interface controls: F1 to hide all, F3 toggles HUD, F4 toggles controls HUD");
 			g2d.setColor(Color.yellow);
@@ -3216,8 +3409,11 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 				int modeHalfW=(w-8)/2;
 				drawButton(g,new Rectangle(x0,y0+244,modeHalfW,32),"Classic Mode: "+(classic?"ON":"OFF"));
 				drawButton(g,new Rectangle(x0+modeHalfW+8,y0+244,modeHalfW,32),"XOR Mode: "+(xor?"ON":"OFF"));
-				drawButton(g,new Rectangle(x0,y0+282,w,30),"Freeze Time: "+(freezeTime?"ON":"OFF"));
-				drawSlider(g,x0,y0+350,w,"Explosion power",(power-1)/126.0,Integer.toString(power));
+				int toggleHalfW=(w-8)/2;
+				drawButton(g,new Rectangle(x0,y0+282,toggleHalfW,30),"Freeze Time: "+(freezeTime?"ON":"OFF"));
+				drawButton(g,new Rectangle(x0+toggleHalfW+8,y0+282,toggleHalfW,30),"Lantern: "+(lanternEnabled?"ON":"OFF"));
+				drawSlider(g,x0,y0+330,w,"AO strength",AO_STRENGTH == 0 ? 0 : AO_STRENGTH, String.format(Locale.ROOT,"%.2f%s",AO_STRENGTH,AO_STRENGTH == 0 ? " (Off)" : ""));
+				drawSlider(g,x0,y0+380,w,"Explosion power",(power-1)/126.0,Integer.toString(power));
 				drawButton(g,new Rectangle(x0,y0+427,w,36),"Back to General Settings");
 				return;
 			}
@@ -3303,7 +3499,11 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
                     if (mx < x0+(w-8)/2) classic=!classic;
                     else { xor=!xor; textures(); }
                 }
-                else if(my>=y0+282&&my<=y0+312) freezeTime=!freezeTime;
+                else if(my>=y0+282&&my<=y0+312) {
+					if (mx < x0 + (w-8)/2) freezeTime=!freezeTime;
+					else lanternEnabled=!lanternEnabled;
+				}
+                else if(my>=y0+338&&my<=y0+362) AO_STRENGTH=Math.round(Math.max(0,Math.min(1,(mx-x0)/(double)w))*100)/100.0;
                 else if(my>=y0+368&&my<=y0+394) power=(byte)(1+Math.round(Math.max(0,Math.min(1,(mx-x0)/(double)w))*126));
 				else if(my>=y0+427&&my<=y0+463) extraSettingsMenu=false;
 			} else if(my>=y0+18&&my<=y0+42) flight=.01*Math.pow(1000,Math.max(0,Math.min(1,(mx-x0)/(double)w)));
@@ -3330,12 +3530,6 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		repaint();
 	}
 
-	private static void resetGeneratedWorld() {
-		if (inFlight != null) { for (Future<byte[]> f : inFlight.futures) f.cancel(true); inFlight = null; }
-		world.clear(); savedChunks.clear(); chunkLastSeen.clear(); featureQueue.clear(); featureEpoch=world.epoch;
-		lcx=Long.MIN_VALUE; lcy=lcz=0; chunkDirty=true; needGround=!fly; Particles.clear();
-	}
-
 	private void menuSliderDrag(int mx, int my) {
 		if (!paused || !settingsMenu || menuSliderTarget < 0) return;
 		double s = Math.max(1, scale);
@@ -3345,6 +3539,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		if (extraSettingsMenu && menuSliderTarget == 5) { reach=(byte)(2+Math.round(Math.max(0,Math.min(1,(mx-x0)/(double)w))*48));
 		} else if (extraSettingsMenu && menuSliderTarget == 6) { setZoom(10*Math.pow(500,Math.max(0,Math.min(1,(mx-x0)/(double)w))));
 		} else if (extraSettingsMenu && menuSliderTarget == 7) { power=(byte)(1+Math.round(Math.max(0,Math.min(1,(mx-x0)/(double)w))*126));
+		} else if (extraSettingsMenu && menuSliderTarget == 8) { AO_STRENGTH=Math.round(Math.max(0,Math.min(1,(mx-x0)/(double)w))*100)/100.0;
 		} else if (menuSliderTarget == 0) {
 			double t=Math.max(0,Math.min(1,(mx-x0)/(double)w)); flight=.01*Math.pow(1000,t);
 		} else if (menuSliderTarget == 1) {
@@ -3373,17 +3568,6 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 			}
 		} catch(Exception ignored) {}
 		rgbEditChannel=-1; rgbEdit="";
-	}
-
-	private static void setAmplitudeAndReload(double value) {
-		tasks.add(() -> {
-			amp=value;
-			if(inFlight!=null){for(Future<byte[]> future:inFlight.futures)future.cancel(true);inFlight=null;}
-			world.clear(); savedChunks.clear(); chunkLastSeen.clear(); featureQueue.clear();
-			featureEpoch=world.epoch; lcx=Long.MIN_VALUE; lcy=lcz=0;
-			Particles.clear(); needGround=!fly; chunkDirty=true;
-			say("Amplitude set to "+(int)value+"; world reloaded");
-		});
 	}
 
 	/** Main thread only. */
@@ -3482,58 +3666,103 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	    tasks.add(() -> doLoad(file));
 	}
 
+	/** Capture only chunks that have been changed by the player; generated terrain is regenerated. */
+	private static Map<Long, Object> changedChunkSnapshot() {
+		Map<Long, Object> chunks = new TreeMap<>(savedChunks);
+		for (int slot = 0; slot < world.keys.length; slot++) {
+			long key = world.keys[slot];
+			if (key != World.NONE && world.user[slot])
+				chunks.put(key, world.data[slot] == null ? EMPTY : world.data[slot]);
+		}
+		return chunks;
+	}
+
+	private static final class SaveSnapshot {
+		final File file;
+		final Map<Long, Object> chunks;
+		final double px, py, pz, pyaw, ppitch, amplitude, fr, fg, fb;
+		final short renderDistance;
+		final long worldTime;
+		final boolean worldCaves, worldTerrain3D, worldClassic, worldXor;
+		SaveSnapshot(File file, Map<Long, Object> chunks) {
+			this.file = file; this.chunks = chunks;
+			px = x; py = y; pz = z; pyaw = yaw; ppitch = pitch; renderDistance = dist; worldTime = time;
+			worldCaves = caves; worldTerrain3D = terrain3D; amplitude = amp; fr = red; fg = green; fb = blue;
+			worldClassic = classic; worldXor = xor;
+		}
+	}
+
 	private static void doSave(File file) {
+		persistentStorage = true;
+		activeSaveFile = file;
+		if (!saveInProgress.compareAndSet(false, true)) {
+			// Never silently discard a save request while another write is running.
+			requestedSaveFile = file;
+			saveRequested = true;
+			return;
+		}
 		flushDirty();
-		Path target = file.toPath();
+		// Snapshot includes player position, rotation, time, settings, and changed chunks.
+		SaveSnapshot snapshot = new SaveSnapshot(file, changedChunkSnapshot());
+		savePool.execute(() -> {
+			try { writeSave(snapshot); }
+			finally { saveInProgress.set(false); }
+		});
+	}
+	/** Best-effort final save for window close, System.exit, and other normal JVM shutdowns. */
+	private static void saveOnShutdown() {
+		if (shutdownSaveStarted) return;
+		shutdownSaveStarted = true;
+		File file = activeSaveFile;
+		if (!persistentStorage || file == null) return; // no chosen world file to save to
+		try {
+			// Let an autosave already in progress finish before writing the final snapshot.
+			long deadline = System.currentTimeMillis() + 15_000L;
+			while (saveInProgress.get() && System.currentTimeMillis() < deadline)
+				Thread.sleep(25L);
+			SaveSnapshot snapshot = new SaveSnapshot(file, changedChunkSnapshot());
+			writeSave(snapshot); // synchronous: shutdown hooks must finish before the JVM exits
+		} catch (Throwable t) {
+			System.err.println("Final world save failed: " + t);
+			t.printStackTrace();
+		}
+	}
+
+	private static void writeSave(SaveSnapshot s) {
+		synchronized (SAVE_LOCK) {
+		writeSaveLocked(s);
+		}
+	}
+
+	private static void writeSaveLocked(SaveSnapshot s) {
+		Path target = s.file.toPath();
 		Path tmp = target.resolveSibling(target.getFileName() + ".tmp");
 		try {
 			try (DataOutputStream out = new DataOutputStream(new BufferedOutputStream(Files.newOutputStream(tmp), 1 << 16))) {
 				out.writeInt(MAGIC);
-				out.writeDouble(x);
-				out.writeDouble(y);
-				out.writeDouble(z);
-				out.writeDouble(yaw);
-				out.writeDouble(pitch);
-				out.writeShort(dist);
-				out.writeLong(time);
-				out.writeBoolean(caves);
-				out.writeBoolean(terrain3D);
-				out.writeDouble(amp);
-				out.writeDouble(red);
-				out.writeDouble(green);
-				out.writeDouble(blue);
-				out.writeBoolean(classic);
-				out.writeBoolean(xor);
-
-				Map<Long, byte[]> sorted = new TreeMap<>(savedChunks);
-				out.writeInt(sorted.size());
-
-				// finish() instead of close(), because closing would also close `out`.
-				Deflater def = new Deflater(Deflater.BEST_COMPRESSION);
+				out.writeDouble(s.px); out.writeDouble(s.py); out.writeDouble(s.pz);
+				out.writeDouble(s.pyaw); out.writeDouble(s.ppitch); out.writeShort(s.renderDistance);
+				out.writeLong(s.worldTime); out.writeBoolean(s.worldCaves); out.writeBoolean(s.worldTerrain3D);
+				out.writeDouble(s.amplitude); out.writeDouble(s.fr); out.writeDouble(s.fg); out.writeDouble(s.fb);
+				out.writeBoolean(s.worldClassic); out.writeBoolean(s.worldXor);
+				out.writeInt(s.chunks.size());
+				Deflater def = new Deflater(Deflater.BEST_SPEED);
 				try {
 					DeflaterOutputStream z = new DeflaterOutputStream(out, def, 1 << 16);
 					DataOutputStream cd = new DataOutputStream(z);
-					for (Map.Entry<Long, byte[]> e : sorted.entrySet()) {
-						byte[] blob = e.getValue();
-						cd.writeLong(e.getKey());
-						cd.writeInt(blob.length);
-						cd.write(blob);
+					for (Map.Entry<Long, Object> e : s.chunks.entrySet()) {
+						byte[] blob = blobOf(e.getValue());
+						cd.writeLong(e.getKey()); cd.writeInt(blob.length); cd.write(blob);
 					}
-					cd.flush();
-					z.finish();
-				} finally {
-					def.end();
-				}
+					cd.flush(); z.finish();
+				} finally { def.end(); }
 			}
-			try {
-				Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
-			} catch (AtomicMoveNotSupportedException ex) {
-				Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING);
-			}
+			try { Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE); }
+			catch (AtomicMoveNotSupportedException ex) { Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING); }
 		} catch (Exception e) {
 			e.printStackTrace();
 			try { Files.deleteIfExists(tmp); } catch (IOException ignored) {}
-			JOptionPane.showMessageDialog(frame, "Failed to save world:\n" + e.getMessage());
+			SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(frame, "Failed to save world:\n" + e.getMessage()));
 		}
 	}
 
@@ -3588,16 +3817,11 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 			velX = velY = velZ = 0;
 
 			setDist(nDist);
-			world.clear();
-			savedChunks.clear();
+			reloadChunks(false);
 			savedChunks.putAll(loaded);
-			chunkLastSeen.clear();
-			Particles.clear();
-
-			lcx = Long.MIN_VALUE;
-			lcy = 0;
-			lcz = 0;
-			chunkDirty = true;
+			activeSaveFile = file;
+			persistentStorage = true;
+			lastPersistentSave = System.currentTimeMillis();
 			needGround = false;
 		} catch (Exception e) {
 			e.printStackTrace();
@@ -3606,7 +3830,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	}
 
 	private static byte[] encode(byte[] data) {
-		byte[] out = new byte[1024];
+		byte[] out = new byte[data.length * 2 + 16];
 		int n = 0, i = 0;
 		final int len = data.length;
 		while (i < len) {
@@ -3615,8 +3839,6 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 			while (j < len && data[j] == v)
 				j++;
 			int run = j - i;
-			if (n + 6 > out.length)
-				out = Arrays.copyOf(out, out.length * 2);
 			out[n++] = v;
 			while (run >= 0x80) {
 				out[n++] = (byte) (run | 0x80);
@@ -3626,26 +3848,6 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 			i = j;
 		}
 		return Arrays.copyOf(out, n);
-	}
-
-	private static byte[] decode(byte[] data) {
-		byte[] out = new byte[VOL];
-		int n = 0, i = 0;
-		while (i < data.length && n < VOL) {
-			byte v = data[i++];
-			int run = 0;
-			for (int shift = 0; i < data.length; shift += 7) {
-				int b = data[i++] & 0xFF;
-				run |= (b & 0x7F) << shift;
-				if (b < 0x80 || shift >= 21)
-					break;
-			}
-			int end = Math.min(VOL, n + run);
-			if (v != 0 && end > n)
-				Arrays.fill(out, n, end, v);
-			n = end;
-		}
-		return out;
 	}
 
 	// ------------------------------------------------------------------ input
@@ -3731,9 +3933,12 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 			final double nx=Double.parseDouble(modifyValues[0]), ny=dispY(Double.parseDouble(modifyValues[1])), nz=Double.parseDouble(modifyValues[2]);
 			final long nt=Long.parseLong(modifyValues[3]); final double na=Double.parseDouble(modifyValues[4]), nf=Double.parseDouble(modifyValues[5]);
 			if(!Double.isFinite(nx)||!Double.isFinite(ny)||!Double.isFinite(nz)||!Double.isFinite(na)||!Double.isFinite(nf)||na<=0||nf<=0) throw new NumberFormatException("values must be finite; amplitude and flight speed must be positive");
-			tasks.add(() -> { boolean terrain=na!=amp, movedXZ=nx!=x||nz!=z; x=nx;y=ny;z=nz;time=nt;amp=na;flight=nf;
-				if(terrain){if(inFlight!=null){for(Future<byte[]> f:inFlight.futures)f.cancel(true);inFlight=null;}world.clear();savedChunks.clear();chunkLastSeen.clear();featureQueue.clear();featureEpoch=world.epoch;lcx=Long.MIN_VALUE;lcy=lcz=0;}
-				if(terrain||movedXZ){Particles.clear();needGround=!fly;} chunkDirty=true; });
+			tasks.add(() -> {
+				boolean terrain = na != amp, movedXZ = nx != x || nz != z;
+				time = nt; amp = na; flight = nf;
+				if (terrain) reloadChunks(false);
+				moveTo(nx, ny, nz, (terrain || movedXZ) ? !fly : needGround);
+			});
 			modifyUi=false;dialogOpen=false;repaint();
 		} catch(NumberFormatException ex) { modifyValues[modifyFocus] = modifyValues[modifyFocus]; say("Invalid value: "+ex.getMessage()); }
 	}
@@ -3866,16 +4071,54 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	    return null;
 	}
 
+	/** Main thread only. Drops every loaded chunk and any in-flight generation so nothing stale survives. */
+	static void reloadChunks(boolean keepEdits) {
+		if (inFlight != null) {
+			for (Future<Octree> f : inFlight.futures) f.cancel(true);
+			inFlight = null;
+		}
+		if (keepEdits) flushDirty(); else clearSaved();
+		world.clear(); // bumps the epoch: any batch still running is discarded
+		featureQueue.clear();
+		featureEpoch = world.epoch;
+		lcx = Long.MIN_VALUE; lcy = lcz = 0;
+		caveCheckX = Long.MIN_VALUE;
+		chunkDirty = true;
+		Particles.clear();
+	}
+
+	/** Main thread only. Long jumps reload all chunks around the new position (edits are kept). */
+	static void moveTo(double nx, double ny, double nz, boolean ground) {
+		double dx = nx - x, dy = ny - y, dz = nz - z;
+		double far = TELEPORT_RELOAD_RADII * radius * SIZE;
+		boolean reload = dx * dx + dy * dy + dz * dz > far * far;
+		x = nx; y = ny; z = nz;
+		prevX = x; prevY = y; prevZ = z;
+		velX = velY = velZ = 0;
+		Particles.clear();
+		if (reload)
+			reloadChunks(true);
+		chunkDirty = true;
+		needGround = ground;
+	}
+
 	private static void teleport(double[] p, boolean ground) {
+		tasks.add(() -> moveTo(p[0], p[1], p[2], ground));
+	}
+
+	private static void resetGeneratedWorld() { // caves / 3D terrain toggled
 		tasks.add(() -> {
-			x = p[0];
-			y = p[1];
-			z = p[2];
-			prevX = x; prevY = y; prevZ = z;
-			velX = velY = velZ = 0;
-			Particles.clear();
-			chunkDirty = true;
-			needGround = ground; // surface targets: snap to the real ground once chunks exist
+			reloadChunks(false);
+			needGround = !fly;
+		});
+	}
+
+	private static void setAmplitudeAndReload(double value) {
+		tasks.add(() -> {
+			amp = value;
+			reloadChunks(false);
+			needGround = !fly;
+			say("Amplitude set to " + (int) value + "; world reloaded");
 		});
 	}
 
@@ -4027,7 +4270,8 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
             if (settingsMenu) {
                 if (extraSettingsMenu && my >= y0+18 && my <= y0+42) menuSliderTarget = 5;
                 else if (extraSettingsMenu && my >= y0+80 && my <= y0+104) menuSliderTarget = 6;
-                else if (extraSettingsMenu && my >= y0+368 && my <= y0+394) menuSliderTarget = 7;
+                else if (extraSettingsMenu && my >= y0+398 && my <= y0+422) menuSliderTarget = 7;
+                else if (extraSettingsMenu && my >= y0+348 && my <= y0+372) menuSliderTarget = 8;
                 else if (my >= y0+18 && my <= y0+42) menuSliderTarget = 0;
                 else if (my >= y0+80 && my <= y0+104) menuSliderTarget = 1;
                 else if (my >= y0+243 && my <= y0+267) menuSliderTarget = 2;
@@ -4124,24 +4368,25 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 }
 
 final class World {
-	static final byte[] UNLOADED = new byte[0];
+	static final Octree UNLOADED = new Octree(0);
 	static final long NONE = Long.MIN_VALUE;
 	int w;
 	long[] keys;
-	byte[][] data;
-	boolean[] dirty;
+	Octree[] data;
+	boolean[] dirty, user;
+	long[] seen;
 	int epoch;
 
-	World(int radius) {
-		resize(radius);
-	}
+	World(int radius) { resize(radius); }
 
 	void resize(int radius) {
 		w = 2 * radius + 1;
 		int n = w * w * w;
 		keys = new long[n];
-		data = new byte[n][];
+		data = new Octree[n];
 		dirty = new boolean[n];
+		user = new boolean[n];
+		seen = new long[n];
 		clear();
 	}
 
@@ -4150,28 +4395,20 @@ final class World {
 		Arrays.fill(keys, NONE);
 		Arrays.fill(data, null);
 		Arrays.fill(dirty, false);
+		Arrays.fill(user, false);
+		worldVer++;
 	}
 
-	/** 21 bits per axis, packed - unique (the old 31-multiplier hash collided). */
 	static long key(long cx, long cy, long cz) {
 		return (cx & 0x1FFFFF) << 42 | (cy & 0x1FFFFF) << 21 | (cz & 0x1FFFFF);
 	}
 
 	static long[] decodeKey(long key) {
-	    long cx = (key >>> 42) & 0x1FFFFF;
-	    long cy = (key >>> 21) & 0x1FFFFF;
-	    long cz = key & 0x1FFFFF;
-
-	    if ((cx & 0x100000) != 0)
-	        cx |= ~0x1FFFFFL;
-
-	    if ((cy & 0x100000) != 0)
-	        cy |= ~0x1FFFFFL;
-
-	    if ((cz & 0x100000) != 0)
-	        cz |= ~0x1FFFFFL;
-
-	    return new long[] { cx, cy, cz };
+		long cx = (key >>> 42) & 0x1FFFFF, cy = (key >>> 21) & 0x1FFFFF, cz = key & 0x1FFFFF;
+		if ((cx & 0x100000) != 0) cx |= ~0x1FFFFFL;
+		if ((cy & 0x100000) != 0) cy |= ~0x1FFFFFL;
+		if ((cz & 0x100000) != 0) cz |= ~0x1FFFFFL;
+		return new long[] { cx, cy, cz };
 	}
 
 	static long unpackX(long k) { return (k << 1) >> 43; }
@@ -4179,27 +4416,28 @@ final class World {
 	static long unpackZ(long k) { return (k << 43) >> 43; }
 
 	int slot(long cx, long cy, long cz) {
-		int ix = (int) (cx % w), iy = (int) (cy % w), iz = (int) (cz % w);
+		int ix = (int) cx % w, iy = (int) cy % w, iz = (int) cz % w;
 		if (ix < 0) ix += w;
 		if (iy < 0) iy += w;
 		if (iz < 0) iz += w;
 		return (ix * w + iy) * w + iz;
 	}
 
-	boolean has(long cx, long cy, long cz) {
-		return keys[slot(cx, cy, cz)] == key(cx, cy, cz);
-	}
+	boolean has(long cx, long cy, long cz) { return keys[slot(cx, cy, cz)] == key(cx, cy, cz); }
 
-	byte[] chunk(long cx, long cy, long cz) {
+	Octree chunk(long cx, long cy, long cz) {
 		int s = slot(cx, cy, cz);
 		return keys[s] == key(cx, cy, cz) ? data[s] : UNLOADED;
 	}
 
-	void put(long cx, long cy, long cz, byte[] d) {
+	void put(long cx, long cy, long cz, Octree d) {
 		int s = slot(cx, cy, cz);
 		data[s] = d;
 		dirty[s] = false;
+		user[s] = false;
 		keys[s] = key(cx, cy, cz);
+		seen[s] = System.currentTimeMillis();
+		worldVer++;
 	}
 
 	void remove(long cx, long cy, long cz) {
@@ -4208,7 +4446,9 @@ final class World {
 			keys[s] = NONE;
 			data[s] = null;
 			dirty[s] = false;
+			user[s] = false;
 		}
+		worldVer++;
 	}
 }
 
@@ -4229,7 +4469,13 @@ final class Render implements Callable<Void> {
 	static float[] depth = new float[0];
 	static double xScale, yScale, shadowDist;
 	static int cachedWinW, cachedWinH;
-	static final double SHADOW_RANGE = 128;
+	static final int SHADOW_RANGE = 128;
+	static boolean[] opaque = new boolean[256];
+	private final Memo aoMemo = new Memo(8192), skyMemo = new Memo(8192), shMemo = new Memo(16384);
+	private int seenWorld = -1, seenSun = -1;
+	static double slx, sly, slz;
+	static int sunVer;
+	static long sunTick = Long.MIN_VALUE;
 
 	static void prepare() {
 		out = buffer;
@@ -4266,6 +4512,7 @@ final class Render implements Callable<Void> {
 		shadowDist = Math.min(dist, SHADOW_RANGE);
 		maxDist = dist;
 		cls = classic;
+		opaque = Nexus.OPAQUE;
 		hl = display;
 		hvX = hoveredX;
 		hvY = hoveredY;
@@ -4282,6 +4529,12 @@ final class Render implements Callable<Void> {
 		lx = light.x;
 		ly = light.y;
 		lz = light.z;
+		long tk = Nexus.time;
+		if (SHADOW_REFRESH_TICKS <= 0 || sunTick == Long.MIN_VALUE || tk < sunTick || tk - sunTick >= SHADOW_REFRESH_TICKS) {
+			sunTick = tk;
+			slx = lx; sly = ly; slz = lz;
+			sunVer++;
+		}
 		sunR = sunColor.x; sunG = sunColor.y; sunB = sunColor.z;
 		ambR = ambColor.x; ambG = ambColor.y; ambB = ambColor.z;
 		skyR = skyColor.x; skyG = skyColor.y; skyB = skyColor.z;
@@ -4290,7 +4543,11 @@ final class Render implements Callable<Void> {
 	}
 
 	private long ccx, ccy, ccz;
-	private byte[] cchunk;
+	private Octree cchunk;
+	// leaf cache: an aligned cube (uniform id, or a packed 2x2x2 cell whose 8 bytes are in cval)
+	private long cox, coy, coz, csz, cval;
+	private int cinfo;
+	private boolean cpk;
 	// last hit
 	private double hT, hHx, hHy, hHz, hR, hG, hB;
 	private int hAxis, hSign;
@@ -4299,17 +4556,20 @@ final class Render implements Callable<Void> {
 	private final Fog fog = new Fog();
 	private long hBx, hBy, hBz;
 	private int hId;
-	// Secondary-ray memoization: adjacent screen pixels commonly hit the same voxel face.
-	private static final int LIGHT_CACHE_SIZE = 4096;
-	private final long[] skyX = new long[LIGHT_CACHE_SIZE], skyY = new long[LIGHT_CACHE_SIZE], skyZ = new long[LIGHT_CACHE_SIZE];
-	private final double[] skyValue = new double[LIGHT_CACHE_SIZE];
-	private final boolean[] skyUsed = new boolean[LIGHT_CACHE_SIZE];
 
 	@Override
 	public Void call() {
-		Arrays.fill(skyUsed, false);
+		if (seenWorld != Nexus.worldVer) {
+			aoMemo.clear(); skyMemo.clear(); shMemo.clear();
+			seenWorld = Nexus.worldVer;
+			seenSun = sunVer;
+		} else if (seenSun != sunVer) {
+			shMemo.clear();
+			seenSun = sunVer;
+		}
 		ccx = ccy = ccz = Long.MIN_VALUE;
 		cchunk = null;
+		csz = 0;
 		int row;
 		while ((row = next.getAndAdd(2)) < h) {
 			renderRow(row);
@@ -4327,6 +4587,34 @@ final class Render implements Callable<Void> {
 
 	private static long tex16(double v) {
 		return ((long) Math.floor(v)) & 15;
+	}
+
+	private int probe(long bx, long by, long bz) {
+		long d = (bx - cox) | (by - coy) | (bz - coz);
+		if (d >= 0 && d < csz)
+			return cpk ? (int) ((cval >>> ((int) ((bx & 1) | ((by & 1) << 1) | ((bz & 1) << 2)) << 3)) & 0xFF) : cinfo;
+		long cx = bx >> SHIFT, cy = by >> SHIFT, cz = bz >> SHIFT;
+		if (cx != ccx || cy != ccy || cz != ccz) {
+			ccx = cx; ccy = cy; ccz = cz;
+			cchunk = world.chunk(cx, cy, cz);
+		}
+		Octree c = cchunk;
+		if (c == World.UNLOADED)
+			return -1;
+		int info = c == null ? 6 << 8 : c.find((int) (bx & MASK), (int) (by & MASK), (int) (bz & MASK));
+		if (info < 0) { // mixed 2x2x2 cell: remember all 8 voxels
+			cval = c.cells[info & Octree.PMASK];
+			cpk = true;
+			csz = 2;
+			cox = bx & ~1L; coy = by & ~1L; coz = bz & ~1L;
+			return (int) ((cval >>> ((int) ((bx & 1) | ((by & 1) << 1) | ((bz & 1) << 2)) << 3)) & 0xFF);
+		}
+		cpk = false;
+		long sz = 1L << (info >> 8), m = ~(sz - 1);
+		cox = bx & m; coy = by & m; coz = bz & m;
+		csz = sz;
+		cinfo = info;
+		return info;
 	}
 
 	private void renderRow(int row) {
@@ -4378,6 +4666,129 @@ final class Render implements Callable<Void> {
 		return Math.min(k, cap);
 	}
 
+	private boolean occluded(double ox, double oy, double oz, double dx, double dy, double dz, double maxT) {
+		long rx = (long) Math.floor(ox), ry = (long) Math.floor(oy), rz = (long) Math.floor(oz);
+		long bx = pbx + rx, by = pby + ry, bz = pbz + rz;
+		int sx = dx > 0 ? 1 : dx < 0 ? -1 : 0;
+		int sy = dy > 0 ? 1 : dy < 0 ? -1 : 0;
+		int sz = dz > 0 ? 1 : dz < 0 ? -1 : 0;
+		double tdx = sx == 0 ? INF : 1.0 / Math.abs(dx);
+		double tdy = sy == 0 ? INF : 1.0 / Math.abs(dy);
+		double tdz = sz == 0 ? INF : 1.0 / Math.abs(dz);
+		double tmx = sx == 0 ? INF : (sx > 0 ? (double) (rx + 1) - ox : ox - rx) * tdx;
+		double tmy = sy == 0 ? INF : (sy > 0 ? (double) (ry + 1) - oy : oy - ry) * tdy;
+		double tmz = sz == 0 ? INF : (sz > 0 ? (double) (rz + 1) - oz : oz - rz) * tdz;
+
+		for (int steps = (int) (3 * maxT) + 16; steps-- > 0;) {
+			int axis;
+			double t;
+			if (tmx < tmy) {
+				if (tmx < tmz) { axis = 0; t = tmx; } else { axis = 2; t = tmz; }
+			} else {
+				if (tmy < tmz) { axis = 1; t = tmy; } else { axis = 2; t = tmz; }
+			}
+			if (t >= maxT)
+				return false;
+			switch (axis) {
+			case 0: bx = sat(bx, sx); tmx += tdx; break;
+			case 1: by = sat(by, sy); tmy += tdy; break;
+			default: bz = sat(bz, sz); tmz += tdz; break;
+			}
+			int info;
+			for (;;) {
+				info = probe(bx, by, bz);
+				if (info < 0)
+					return false; // unloaded
+				int lg = info >> 8;
+				if ((info & 0xFF) != AIR || lg == 0)
+					break;
+				long S = 1L << lg, M = ~(S - 1);
+				long x0c = bx & M, y0c = by & M, z0c = bz & M;
+				long nx = sx > 0 ? x0c + S - bx : sx < 0 ? bx - x0c + 1 : 0;
+				long ny = sy > 0 ? y0c + S - by : sy < 0 ? by - y0c + 1 : 0;
+				long nz = sz > 0 ? z0c + S - bz : sz < 0 ? bz - z0c + 1 : 0;
+				double ex = sx == 0 ? INF : tmx + (nx - 1) * tdx;
+				double ey = sy == 0 ? INF : tmy + (ny - 1) * tdy;
+				double ez = sz == 0 ? INF : tmz + (nz - 1) * tdz;
+				int ea;
+				double te;
+				if (ex <= ey && ex <= ez) { ea = 0; te = ex; }
+				else if (ey <= ez) { ea = 1; te = ey; }
+				else { ea = 2; te = ez; }
+				if (te >= maxT)
+					return false;
+				long kx = ea == 0 ? nx : (sx == 0 ? 0 : crossed(tmx, tdx, te, nx - 1));
+				long ky = ea == 1 ? ny : (sy == 0 ? 0 : crossed(tmy, tdy, te, ny - 1));
+				long kz = ea == 2 ? nz : (sz == 0 ? 0 : crossed(tmz, tdz, te, nz - 1));
+				if (kx != 0) { bx += sx * kx; tmx += kx * tdx; }
+				if (ky != 0) { by += sy * ky; tmy += ky * tdy; }
+				if (kz != 0) { bz += sz * kz; tmz += kz * tdz; }
+				axis = ea;
+				t = te;
+			}
+			int id = info & 0xFF;
+			if (id == AIR)
+				continue;
+			if (opaque[id])
+				return true; // every texel solid: no hit position or texture lookup needed
+			if (id == GLASS) {
+				long ax = bx - (axis == 0 ? sx : 0), ay = by - (axis == 1 ? sy : 0), az = bz - (axis == 2 ? sz : 0);
+				if (getBlock(ax, ay, az) == GLASS)
+					continue;
+			}
+			// leaves / glass: same texel test as march()
+			double hx = ox + dx * t, hy = oy + dy * t, hz = oz + dz * t;
+			int texX, texY;
+			if (axis == 1) {
+				texX = (int) tex16(hx * 16);
+				texY = (int) tex16(hz * 16);
+				if (dy < 0.0)
+					texY += 32;
+			} else {
+				texX = (int) tex16((hx + hz) * 16);
+				texY = (int) tex16(hy * 16) + 16;
+			}
+			if ((atlas[texX + texY * 16 + id * 768] & 0xFFFFFF) != 0)
+				return true;
+		}
+		return false;
+	}
+
+	private boolean inShadow(double hx, double hy, double hz, int axis, int sign, long fx, long fy, long fz, double t) {
+		int G = SHADOW_GRID;
+		double ox = hx, oy = hy, oz = hz;
+		long key = 0;
+		if (G > 0) {
+			// Far surfaces cover many texels per pixel: use a coarser grid so more pixels share one ray.
+			double fp = t * Math.max(xScale, yScale);
+			while (G > 4 && G * fp * SHADOW_LOD > 1.0)
+				G >>= 1;
+			long cu, cv, nw;
+			switch (axis) {
+			case 0:
+				cu = (long) Math.floor((pby + hy) * G); cv = (long) Math.floor((pbz + hz) * G); nw = fx;
+				oy = (cu + 0.5) / G - pby; oz = (cv + 0.5) / G - pbz;
+				break;
+			case 1:
+				cu = (long) Math.floor((pbx + hx) * G); cv = (long) Math.floor((pbz + hz) * G); nw = fy;
+				ox = (cu + 0.5) / G - pbx; oz = (cv + 0.5) / G - pbz;
+				break;
+			default:
+				cu = (long) Math.floor((pbx + hx) * G); cv = (long) Math.floor((pby + hy) * G); nw = fz;
+				ox = (cu + 0.5) / G - pbx; oy = (cv + 0.5) / G - pby;
+			}
+			key = Memo.hash(cu, cv, nw, ((long) G << 4) | (axis << 1) | (sign > 0 ? 1 : 0));
+			int c = shMemo.get(key);
+			if (c >= 0)
+				return c != 0;
+		}
+		double nx = axis == 0 ? sign : 0, ny = axis == 1 ? sign : 0, nz = axis == 2 ? sign : 0;
+		boolean s = occluded(ox + nx * EPS, oy + ny * EPS, oz + nz * EPS, slx, sly, slz, shadowDist);
+		if (G > 0)
+			shMemo.put(key, s ? 1 : 0);
+		return s;
+	}
+
 	private boolean march(double ox, double oy, double oz, double dx, double dy, double dz, double maxT, boolean primary, boolean center) {
 		long rx = (long) Math.floor(ox), ry = (long) Math.floor(oy), rz = (long) Math.floor(oz);
 		long bx = pbx + rx, by = pby + ry, bz = pbz + rz;
@@ -4408,20 +4819,20 @@ final class Render implements Callable<Void> {
 			case 1: by = sat(by, sy); tmy += tdy; break;
 			default: bz = sat(bz, sz); tmz += tdz; break;
 			}
-			long cx = bx >> SHIFT, cy = by >> SHIFT, cz = bz >> SHIFT;
-			if (cx != ccx || cy != ccy || cz != ccz) {
-				ccx = cx; ccy = cy; ccz = cz;
-				cchunk = world.chunk(cx, cy, cz);
-			}
-			byte[] chunk = cchunk;
-
-			// Empty chunk: jump to where the ray leaves it, then re-check the voxel we land in.
-			while (chunk == null) {
-				long x0c = cx << SHIFT, y0c = cy << SHIFT, z0c = cz << SHIFT;
-				// crossings needed on each axis to step out of this chunk
-				long nx = sx > 0 ? x0c + SIZE - bx : sx < 0 ? bx - x0c + 1 : 0;
-				long ny = sy > 0 ? y0c + SIZE - by : sy < 0 ? by - y0c + 1 : 0;
-				long nz = sz > 0 ? z0c + SIZE - bz : sz < 0 ? bz - z0c + 1 : 0;
+			int info;
+			for (;;) {
+				info = probe(bx, by, bz);
+				if (info < 0)
+					return false; // unloaded
+				int lg = info >> 8;
+				if ((info & 0xFF) != AIR || lg == 0)
+					break;
+				// Air cube of side 2^lg: jump to where the ray leaves it.
+				long S = 1L << lg, M = ~(S - 1);
+				long x0c = bx & M, y0c = by & M, z0c = bz & M;
+				long nx = sx > 0 ? x0c + S - bx : sx < 0 ? bx - x0c + 1 : 0;
+				long ny = sy > 0 ? y0c + S - by : sy < 0 ? by - y0c + 1 : 0;
+				long nz = sz > 0 ? z0c + S - bz : sz < 0 ? bz - z0c + 1 : 0;
 				double ex = sx == 0 ? INF : tmx + (nx - 1) * tdx;
 				double ey = sy == 0 ? INF : tmy + (ny - 1) * tdy;
 				double ez = sz == 0 ? INF : tmz + (nz - 1) * tdz;
@@ -4431,7 +4842,7 @@ final class Render implements Callable<Void> {
 				else if (ey <= ez) { ea = 1; te = ey; }
 				else { ea = 2; te = ez; }
 				if (te >= maxT)
-					return false; // the ray ends inside empty space
+					return false;
 				long kx = ea == 0 ? nx : (sx == 0 ? 0 : crossed(tmx, tdx, te, nx - 1));
 				long ky = ea == 1 ? ny : (sy == 0 ? 0 : crossed(tmy, tdy, te, ny - 1));
 				long kz = ea == 2 ? nz : (sz == 0 ? 0 : crossed(tmz, tdz, te, nz - 1));
@@ -4439,18 +4850,9 @@ final class Render implements Callable<Void> {
 				if (ky != 0) { by += sy * ky; tmy += ky * tdy; }
 				if (kz != 0) { bz += sz * kz; tmz += kz * tdz; }
 				axis = ea;
-				t = te; // we entered the new voxel through this face at this time
-				cx = bx >> SHIFT; cy = by >> SHIFT; cz = bz >> SHIFT;
-				if (cx != ccx || cy != ccy || cz != ccz) {
-					ccx = cx; ccy = cy; ccz = cz;
-					cchunk = world.chunk(cx, cy, cz);
-				}
-				chunk = cchunk;
+				t = te;
 			}
-			if (chunk == World.UNLOADED)
-				return false;
-
-			int id = chunk[(int) (bx & MASK) | ((int) (by & MASK) << SHIFT) | ((int) (bz & MASK) << 2 * SHIFT)];
+			int id = info & 0xFF;
 			if (id == AIR)
 				continue;
 
@@ -4530,26 +4932,69 @@ final class Render implements Callable<Void> {
 		fogCamR = camFog.r; fogCamG = camFog.g; fogCamB = camFog.b;
 	}
 
-	/** Classic: flat face shading + biome fog blend. */
+	/** AO multiplier for the face just hit: 1 = open, 1 - strength = deepest corner. */
+	private double faceAO(double hx, double hy, double hz, int axis, long fx, long fy, long fz, double strength) {
+		double u = axis == 0 ? hy : hx, v = axis == 2 ? hy : hz;
+		return 1 - strength * (1 - aoAt(fx, fy, fz, axis, u - Math.floor(u), v - Math.floor(v)));
+	}
+
 	private void shadeClassic() {
-		fog.at(pbx + hHx, pby + hHy, pbz + hHz);
+		final double hx = hHx, hy = hHy, hz = hHz;
+		final int axis = hAxis, sign = hSign;
+		fog.at(pbx + hx, pby + hy, pbz + hz);
 		double ft = Math.min(1, hT * fog.dens / maxDist);
-		double s = (0xFF - (hAxis + 2) % 3 * 50) / 255.0 * (1 - ft);
+		double s = (0xFF - (axis + 2) % 3 * 50) / 255.0 * (1 - ft);
+		if (ft < FOG_SKIP && lightQ >= 1 && AO_STRENGTH > 0 && (hId >= OPAQUE.length || OPAQUE[hId])) {
+			long fx = hBx + (axis == 0 ? sign : 0), fy = hBy + (axis == 1 ? sign : 0), fz = hBz + (axis == 2 ? sign : 0);
+			s *= faceAO(hx, hy, hz, axis, fx, fy, fz, AO_STRENGTH);
+		}
 		hR = hR * s + fog.r * ft;
 		hG = hG * s + fog.g * ft;
 		hB = hB * s + fog.b * ft;
 	}
 
-	private boolean solid(long x, long y, long z) {
-		long cx = x >> SHIFT, cy = y >> SHIFT, cz = z >> SHIFT;
-		if (cx != ccx || cy != ccy || cz != ccz) {
-			ccx = cx; ccy = cy; ccz = cz;
-			cchunk = world.chunk(cx, cy, cz);
+	private void shadeModern() {
+		// the skylight rays overwrite the h* fields, so copy everything first
+		final double hx = hHx, hy = hHy, hz = hHz, t = hT, cr = hR, cg = hG, cb = hB;
+		final int axis = hAxis, sign = hSign, id = hId, q = lightQ;
+		fog.at(pbx + hx, pby + hy, pbz + hz);
+		final double ft = Math.min(1, t * fog.dens / maxDist);
+		final double gl = GLOW[id];
+
+		if (ft >= FOG_SKIP) { // almost pure fog: flat ambient light is indistinguishable here
+			hR = cr * (ambR * 0.55 + gl) * (1 - ft) + fog.r * ft;
+			hG = cg * (ambG * 0.55 + gl) * (1 - ft) + fog.g * ft;
+			hB = cb * (ambB * 0.55 + gl) * (1 - ft) + fog.b * ft;
+			return;
 		}
-		byte[] c = cchunk;
-		if (c == null || c == World.UNLOADED)
-			return false;
-		return c[(int) (x & MASK) | ((int) (y & MASK) << SHIFT) | ((int) (z & MASK) << 2 * SHIFT)] != AIR;
+
+		final long fx = hBx + (axis == 0 ? sign : 0), fy = hBy + (axis == 1 ? sign : 0), fz = hBz + (axis == 2 ? sign : 0);
+		double sun = Math.max(0, sign * (axis == 0 ? lx : axis == 1 ? ly : lz));
+		if (sun > 0.02 && inShadow(hx, hy, hz, axis, sign, fx, fy, fz, t))
+			sun = 0;
+		double ao = 1, sky = 1;
+		if (AO_STRENGTH > 0 && q >= 1 && id < OPAQUE.length && OPAQUE[id])
+			ao = faceAO(hx, hy, hz, axis, fx, fy, fz, AO_STRENGTH);
+		if (q >= 2)
+			sky = skyLight(fx, fy, fz);
+
+		double amb = (0.1 + 0.9 * sky) * ao;
+		double k = sun * 0.55 * (0.6 + 0.4 * ao);
+		double lamp = lanternEnabled && !classic ? (1 - sky) * Math.max(0, 1 - t / 18.0) * 0.7 : 0;
+		double lr = ambR * amb + sunR * k + lamp;
+		double lg = ambG * amb + sunG * k + lamp * 0.8;
+		double lb = ambB * amb + sunB * k + lamp * 0.5;
+
+		hR = cr * (lr + gl) * (1 - ft) + fog.r * ft;
+		hG = cg * (lg + gl) * (1 - ft) + fog.g * ft;
+		hB = cb * (lb + gl) * (1 - ft) + fog.b * ft;
+	}
+
+	private boolean solid(long x, long y, long z) {
+		int p = probe(x, y, z);
+		if (p < 0) return false;
+		int id = p & 0xFF;
+		return id < OPAQUE.length && OPAQUE[id];
 	}
 
 	private int occ(long x, long y, long z, int axis, int i, int j) {
@@ -4566,82 +5011,51 @@ final class Render implements Callable<Void> {
 		return s1 == 1 && s2 == 1 ? 0 : 3 - (s1 + s2 + c);
 	}
 
-	/** Per-vertex voxel ambient occlusion, bilinearly interpolated over the face. 0 = dark, 1 = open. */
 	private double aoAt(long x, long y, long z, int a, double fu, double fv) {
-		int um = occ(x, y, z, a, -1, 0), up = occ(x, y, z, a, 1, 0);
-		int vm = occ(x, y, z, a, 0, -1), vp = occ(x, y, z, a, 0, 1);
-		double a00 = vertexAO(um, vm, occ(x, y, z, a, -1, -1)), a10 = vertexAO(up, vm, occ(x, y, z, a, 1, -1));
-		double a01 = vertexAO(um, vp, occ(x, y, z, a, -1, 1)),  a11 = vertexAO(up, vp, occ(x, y, z, a, 1, 1));
+		long key = Memo.hash(x, y, z, a);
+		int p = aoMemo.get(key);
+		if (p < 0) {
+			int um = occ(x, y, z, a, -1, 0), up = occ(x, y, z, a, 1, 0);
+			int vm = occ(x, y, z, a, 0, -1), vp = occ(x, y, z, a, 0, 1);
+			p = vertexAO(um, vm, occ(x, y, z, a, -1, -1))
+				| vertexAO(up, vm, occ(x, y, z, a, 1, -1)) << 2
+				| vertexAO(um, vp, occ(x, y, z, a, -1, 1)) << 4
+				| vertexAO(up, vp, occ(x, y, z, a, 1, 1)) << 6;
+			aoMemo.put(key, p);
+		}
+		double a00 = p & 3, a10 = (p >> 2) & 3, a01 = (p >> 4) & 3, a11 = (p >> 6) & 3;
 		double lo = a00 + (a10 - a00) * fu, hi = a01 + (a11 - a01) * fu;
 		return (lo + (hi - lo) * fv) / 3.0;
 	}
 
-	/** Sky exposure cached per voxel; many neighbouring pixels hit the same block. */
 	private static final double[][] SKY_OFFSETS = {{0,0},{0.72,0},{-0.72,0},{0,0.72},{0,-0.72}};
 
 	private double skyLight(long fx, long fy, long fz) {
-		long hash = fx * 0x9E3779B97F4A7C15L ^ Long.rotateLeft(fy * 0xC2B2AE3D27D4EB4FL, 17) ^ Long.rotateLeft(fz, 37);
-		int i = (int) (hash ^ (hash >>> 32)) & (LIGHT_CACHE_SIZE - 1);
-		if (skyUsed[i] && skyX[i] == fx && skyY[i] == fy && skyZ[i] == fz)
-			return skyValue[i];
-		// Average a small bundle of vertical rays. A lone block directly overhead
-		// should only affect one sample, not create a conspicuous dark spot in daylight.
+		long key = Memo.hash(fx, fy, fz, 0);
+		int c = skyMemo.get(key);
+		if (c >= 0)
+			return c / 255.0;
 		double total = 0;
 		for (double[] o : SKY_OFFSETS) {
 			double ox = (fx - pbx) + 0.5 + o[0], oz = (fz - pbz) + 0.5 + o[1];
 			boolean blocked = march(ox, (fy - pby) + 0.5, oz, 0, -1, 0, 64, false, false);
 			total += blocked ? Math.min(1, hT / 24.0) * 0.5 : 1.0;
 		}
-		double value = total / SKY_OFFSETS.length;
-		skyUsed[i] = true; skyX[i] = fx; skyY[i] = fy; skyZ[i] = fz; skyValue[i] = value;
-		return value;
-	}
-
-	/** Modern: sun + shadow ray, AO, skylight, lantern, emissive blocks, then biome fog on top. */
-	private void shadeModern() {
-		// secondary rays overwrite the h* fields, so copy everything first
-		final double hx = hHx, hy = hHy, hz = hHz, t = hT, cr = hR, cg = hG, cb = hB;
-		final int axis = hAxis, sign = hSign, id = hId, q = lightQ;
-		final long fx = hBx + (axis == 0 ? sign : 0), fy = hBy + (axis == 1 ? sign : 0), fz = hBz + (axis == 2 ? sign : 0);
-		fog.at(pbx + hx, pby + hy, pbz + hz);
-
-		double sun = Math.max(0, sign * (axis == 0 ? lx : axis == 1 ? ly : lz));
-		if (sun > 0.02) {
-			double nx = axis == 0 ? sign : 0, ny = axis == 1 ? sign : 0, nz = axis == 2 ? sign : 0;
-			if (march(hx + nx * EPS, hy + ny * EPS, hz + nz * EPS, lx, ly, lz, shadowDist, false, false))
-				sun = 0;
-		}
-		double ao = 1, sky = 1;
-		if (q >= 1) {
-			double u = axis == 0 ? hy : hx, v = axis == 2 ? hy : hz;
-			ao = 0.4 + 0.6 * aoAt(fx, fy, fz, axis, u - Math.floor(u), v - Math.floor(v));
-		}
-		if (q >= 2)
-			sky = skyLight(fx, fy, fz);
-
-		double amb = (0.1 + 0.9 * sky) * ao;
-		double k = sun * 0.55 * (0.6 + 0.4 * ao);
-		double lamp = q >= 2 ? (1 - sky) * Math.max(0, 1 - t / 18.0) * 0.7 : 0; // warm lantern carried by the player
-		double lr = ambR * amb + sunR * k + lamp;
-		double lg = ambG * amb + sunG * k + lamp * 0.8;
-		double lb = ambB * amb + sunB * k + lamp * 0.5;
-		double gl = GLOW[id];
-
-		double ft = Math.min(1, t * fog.dens / maxDist);
-		hR = cr * (lr + gl) * (1 - ft) + fog.r * ft;
-		hG = cg * (lg + gl) * (1 - ft) + fog.g * ft;
-		hB = cb * (lb + gl) * (1 - ft) + fog.b * ft;
+		int q = (int) Math.round(total / SKY_OFFSETS.length * 255);
+		skyMemo.put(key, q);
+		return q / 255.0;
 	}
 }
 
 /** Fixed-capacity struct-of-arrays particle pool. Main thread only. World +y is down, so "up" is negative vy. */
 final class Particles {
 	static final int CAP = 65536;
+	static int cap = 2048;
 	static final double GRAVITY = 0.002, DRAG = 0.995;
-	static final double[] pX = new double[CAP], pY = new double[CAP], pZ = new double[CAP];
-	static final double[] vX = new double[CAP], vY = new double[CAP], vZ = new double[CAP];
-	static final float[] size = new float[CAP];
-	static final int[] color = new int[CAP], life = new int[CAP];
+	static double[] pX = new double[cap], pY = new double[cap], pZ = new double[cap];
+	static double[] vX = new double[cap], vY = new double[cap], vZ = new double[cap];
+	static float[] size = new float[cap];
+	static int[] color = new int[cap], life = new int[cap], brightness = new int[cap];
 	static int count, overwrite;
 	static final Random R = new Random();
 
@@ -4649,11 +5063,22 @@ final class Particles {
 		count = 0;
 	}
 
+	private static void grow() {
+		int nc = Math.min(CAP, cap << 1);
+		pX = Arrays.copyOf(pX, nc); pY = Arrays.copyOf(pY, nc); pZ = Arrays.copyOf(pZ, nc);
+		vX = Arrays.copyOf(vX, nc); vY = Arrays.copyOf(vY, nc); vZ = Arrays.copyOf(vZ, nc);
+		size = Arrays.copyOf(size, nc); color = Arrays.copyOf(color, nc); life = Arrays.copyOf(life, nc); brightness = Arrays.copyOf(brightness, nc);
+		cap = nc;
+	}
+
 	static void spawn(double sx, double sy, double sz, double vx, double vy, double vz, int rgb, double sz2, int ttl) {
 		int i;
-		if (count < CAP) {
+		if (count < cap) {
 			i = count++;
-		} else { // pool full: recycle slots round-robin
+		} else if (cap < CAP) {
+			grow();
+			i = count++;
+		} else {
 			i = overwrite;
 			overwrite = (overwrite + 1) & (CAP - 1);
 		}
@@ -4662,6 +5087,7 @@ final class Particles {
 		color[i] = rgb;
 		size[i] = (float) sz2;
 		life[i] = ttl;
+		brightness[i] = sampleBrightness(sx, sy, sz);
 	}
 
 	static int sample(int id) {
@@ -4733,7 +5159,7 @@ final class Particles {
 	}
 
 	private static long qx = Long.MIN_VALUE, qy, qz;
-	private static byte[] qc; // chunk cache, valid for one update() pass
+	private static Octree qc; // chunk cache, valid for one update() pass
 
 	private static boolean solid(double x, double y, double z) {
 		long bx = (long) Math.floor(x), by = (long) Math.floor(y), bz = (long) Math.floor(z);
@@ -4742,10 +5168,23 @@ final class Particles {
 			qx = cx; qy = cy; qz = cz;
 			qc = world.chunk(cx, cy, cz);
 		}
-		byte[] c = qc;
+		Octree c = qc;
 		if (c == null || c == World.UNLOADED)
 			return false;
-		return c[(int) (bx & MASK) | ((int) (by & MASK) << SHIFT) | ((int) (bz & MASK) << 2 * SHIFT)] != AIR;
+		return c.get((int) (bx & MASK), (int) (by & MASK), (int) (bz & MASK)) != AIR;
+	}
+
+	/** Approximate local daylight from sky exposure; particles in enclosed spaces stay dim. */
+	private static int sampleBrightness(double x, double y, double z) {
+		long bx = (long) Math.floor(x), by = (long) Math.floor(y), bz = (long) Math.floor(z);
+		int openness = 0;
+		for (int up = 1; up <= 8; up++) {
+			if (solid(bx, by - up, bz))
+				break;
+			openness++;
+		}
+		// Even deep-cave particles retain a little ambient visibility.
+		return 64 + openness * 23; // 64 in darkness, 248 when open above
 	}
 
 	static void update() {
@@ -4768,6 +5207,10 @@ final class Particles {
 				vy = Math.abs(vy) < 0.006 ? 0 : -vy * 0.4;
 			} else y = ny;
 
+			if ((long) Math.floor(x) != (long) Math.floor(pX[i])
+					|| (long) Math.floor(y) != (long) Math.floor(pY[i])
+					|| (long) Math.floor(z) != (long) Math.floor(pZ[i]))
+				brightness[i] = sampleBrightness(x, y, z);
 			pX[i] = x; pY[i] = y; pZ[i] = z;
 			vX[i] = vx; vY[i] = vy; vZ[i] = vz;
 			i++;
@@ -4816,7 +5259,7 @@ final class Particles {
 			return;
 		pX[i] = pX[l]; pY[i] = pY[l]; pZ[i] = pZ[l];
 		vX[i] = vX[l]; vY[i] = vY[l]; vZ[i] = vZ[l];
-		size[i] = size[l]; color[i] = color[l]; life[i] = life[l];
+		size[i] = size[l]; color[i] = color[l]; life[i] = life[l]; brightness[i] = brightness[l];
 	}
 }
 
@@ -4949,4 +5392,289 @@ final class Fog {
 			r += (k[0] - r) * c; g += (k[1] - g) * c; b += (k[2] - b) * c; dens += (k[3] - dens) * c;
 		}
 	}
+}
+
+final class Octree {
+	static final int LEAF = 0x80000000, PACKED = 0xC0000000, PBIT = 0x40000000, PMASK = 0x3FFFFFFF;
+	static final long ONES = 0x0101010101010101L;
+	static final int[] EMPTY_I = new int[0];
+	static final long[] EMPTY_L = new long[0];
+	private static final int[] OFF = { 0, 1, 64, 65, 4096, 4097, 4160, 4161 };
+	private static final int[] P_BLOCK = new int[8], P_ENTRY = new int[8]; // main-thread edits only
+	private static final Octree[] UNIFORM = new Octree[256];
+	private static final ThreadLocal<Octree> SCRATCH = ThreadLocal.withInitial(() -> new Octree(2048));
+	private static final ThreadLocal<int[][]> SC = ThreadLocal.withInitial(() -> new int[7][8]);
+	static {
+		for (int i = 0; i < 256; i++) {
+			Octree o = new Octree(0);
+			o.root = LEAF | i;
+			o.shared = true;
+			UNIFORM[i] = o;
+		}
+	}
+
+	int[] n;
+	long[] cells = EMPTY_L;
+	int root = LEAF; // LEAF = all air
+	int top, free = -1, ctop, cfree = -1;
+	boolean shared;  // immutable shared uniform chunk: copy() before editing
+
+	Octree(int cap) { n = cap == 0 ? EMPTY_I : new int[cap]; }
+
+	static Octree uniform(int id) { return UNIFORM[id & 0xFF]; }
+
+	boolean isEmpty() { return root == LEAF; }
+
+	int memoryBytes() { return n.length * 4 + cells.length * 8 + 48; }
+
+	/** Fresh editable copy of a shared uniform chunk. */
+	Octree copy() {
+		Octree o = new Octree(64);
+		o.root = root;
+		return o;
+	}
+
+	/** Drop spare capacity (call when a chunk goes to cold storage). */
+	void compact() {
+		if (top < n.length) n = Arrays.copyOf(n, top);
+		if (ctop < cells.length) cells = ctop == 0 ? EMPTY_L : Arrays.copyOf(cells, ctop);
+	}
+
+	void reset() {
+		root = LEAF; top = 0; free = -1; ctop = 0; cfree = -1;
+	}
+
+	/** Block at local coordinates (0..63). */
+	byte get(int x, int y, int z) {
+		int v = root, sh = 6;
+		final int[] a = n;
+		while (v >= 0) {
+			sh--;
+			v = a[v + (((x >> sh) & 1) | (((y >> sh) & 1) << 1) | (((z >> sh) & 1) << 2))];
+		}
+		if ((v & PBIT) != 0)
+			return (byte) (cells[v & PMASK] >>> (((x & 1) | ((y & 1) << 1) | ((z & 1) << 2)) << 3));
+		return (byte) v;
+	}
+
+	/**
+	 * Uniform cube containing the voxel: returns (log2 size << 8 | id) (>= 0),
+	 * or the raw PACKED entry (< 0) when the voxel lies in a mixed 2x2x2 cell.
+	 */
+	int find(int x, int y, int z) {
+		int v = root, lg = 6;
+		final int[] a = n;
+		while (v >= 0) {
+			lg--;
+			v = a[v + (((x >> lg) & 1) | (((y >> lg) & 1) << 1) | (((z >> lg) & 1) << 2))];
+		}
+		if ((v & PBIT) != 0)
+			return v;
+		return lg << 8 | (v & 0xFF);
+	}
+
+	private int alloc(int v) {
+		int b;
+		if (free >= 0) {
+			b = free;
+			free = n[b];
+		} else {
+			b = top;
+			top += 8;
+			if (top > n.length)
+				n = Arrays.copyOf(n, Math.max(64, n.length * 2));
+		}
+		Arrays.fill(n, b, b + 8, v);
+		return b;
+	}
+
+	private void release(int b) {
+		n[b] = free;
+		free = b;
+	}
+
+	private int allocCell(long v) {
+		int i;
+		if (cfree >= 0) {
+			i = cfree;
+			cfree = (int) cells[i];
+		} else {
+			i = ctop++;
+			if (i >= cells.length)
+				cells = Arrays.copyOf(cells, Math.max(16, cells.length * 2));
+		}
+		cells[i] = v;
+		return i;
+	}
+
+	private void releaseCell(int i) {
+		cells[i] = cfree;
+		cfree = i;
+	}
+
+	/** Sets a voxel; splits uniform leaves on demand and re-merges uniform siblings. Returns true if changed. */
+	boolean set(int x, int y, int z, byte b) {
+		final int id = b & 0xFF, lv = LEAF | id;
+		if (root < 0) {
+			if (root == lv) return false;
+			root = alloc(root);
+		}
+		int node = root, entry = -1, d = 0, sh = 5;
+		for (;;) {
+			P_BLOCK[d] = node;
+			P_ENTRY[d] = entry;
+			d++;
+			int idx = node + (((x >> sh) & 1) | (((y >> sh) & 1) << 1) | (((z >> sh) & 1) << 2));
+			int v = n[idx];
+			if (v >= 0) {
+				node = v; entry = idx; sh--;
+				continue;
+			}
+			int sub = ((x & 1) | ((y & 1) << 1) | ((z & 1) << 2)) << 3;
+			if ((v & PBIT) != 0) { // edit inside a packed cell
+				int ci = v & PMASK;
+				long old = cells[ci];
+				if (((old >>> sub) & 0xFF) == id) return false;
+				long nv = (old & ~(0xFFL << sub)) | ((long) id << sub);
+				if (nv != (nv & 0xFF) * ONES) {
+					cells[ci] = nv;
+					return true;
+				}
+				releaseCell(ci); // became uniform again
+				n[idx] = LEAF | (int) (nv & 0xFF);
+				break;
+			}
+			if (v == lv) return false;
+			if (sh == 1) { // uniform 2x2x2 leaf -> packed cell
+				long base = (long) (v & 0xFF) * ONES;
+				long nv = (base & ~(0xFFL << sub)) | ((long) id << sub);
+				n[idx] = PACKED | allocCell(nv);
+				return true;
+			}
+			int c = alloc(v);
+			n[idx] = c;
+			node = c; entry = idx; sh--;
+		}
+		for (int i = d - 1; i >= 0; i--) { // merge uniform blocks back into leaves
+			int blk = P_BLOCK[i], f = n[blk];
+			if (f >= 0 || (f & PBIT) != 0)
+				break;
+			boolean same = true;
+			for (int k = 1; k < 8; k++)
+				if (n[blk + k] != f) { same = false; break; }
+			if (!same)
+				break;
+			release(blk);
+			if (P_ENTRY[i] < 0) root = f; else n[P_ENTRY[i]] = f;
+		}
+		return true;
+	}
+
+	/** Compress a dense chunk (index = x | y<<6 | z<<12). null = entirely air; uniform chunks are shared. */
+	static Octree build(byte[] d) {
+		Octree s = SCRATCH.get();
+		s.reset();
+		int r = s.make(d, 0, 0, 0, 6, SC.get());
+		Octree res;
+		if (r < 0) {
+			int id = r & 0xFF;
+			res = id == 0 ? null : uniform(id);
+		} else {
+			res = new Octree(0);
+			res.root = r;
+			res.n = Arrays.copyOf(s.n, s.top);
+			res.cells = s.ctop == 0 ? EMPTY_L : Arrays.copyOf(s.cells, s.ctop);
+			res.top = s.top;
+			res.ctop = s.ctop;
+		}
+		if (s.n.length > 65536) s.n = new int[2048];
+		if (s.cells.length > 8192) s.cells = EMPTY_L;
+		return res;
+	}
+
+	private int make(byte[] d, int x, int y, int z, int lg, int[][] sc) {
+		if (lg == 1) {
+			int base = x | (y << 6) | (z << 12);
+			byte f = d[base];
+			if (d[base + 1] == f && d[base + 64] == f && d[base + 65] == f && d[base + 4096] == f
+					&& d[base + 4097] == f && d[base + 4160] == f && d[base + 4161] == f)
+				return LEAF | (f & 0xFF);
+			long p = 0;
+			for (int i = 0; i < 8; i++)
+				p |= (long) (d[base + OFF[i]] & 0xFF) << (i << 3);
+			return PACKED | allocCell(p);
+		}
+		int[] c = sc[lg];
+		int h = 1 << (lg - 1);
+		for (int i = 0; i < 8; i++)
+			c[i] = make(d, x + ((i & 1) != 0 ? h : 0), y + ((i & 2) != 0 ? h : 0), z + ((i & 4) != 0 ? h : 0), lg - 1, sc);
+		int f = c[0];
+		boolean uni = f < 0 && (f & PBIT) == 0;
+		for (int k = 1; k < 8 && uni; k++)
+			if (c[k] != f) uni = false;
+		if (uni)
+			return f;
+		int b = alloc(0);
+		System.arraycopy(c, 0, n, b, 8);
+		return b;
+	}
+
+	/** Expand into a dense array (length 64^3). */
+	void toDense(byte[] out) {
+		Arrays.fill(out, (byte) 0);
+		expand(root, 0, 0, 0, 64, out);
+	}
+
+	private void expand(int v, int x, int y, int z, int size, byte[] out) {
+		if (v < 0) {
+			if ((v & PBIT) != 0) {
+				long p = cells[v & PMASK];
+				for (int i = 0; i < 8; i++) {
+					byte id = (byte) (p >>> (i << 3));
+					if (id != 0)
+						out[(x + (i & 1)) | ((y + ((i >> 1) & 1)) << 6) | ((z + ((i >> 2) & 1)) << 12)] = id;
+				}
+				return;
+			}
+			byte id = (byte) v;
+			if (id == 0) return;
+			for (int zz = z; zz < z + size; zz++)
+				for (int yy = y; yy < y + size; yy++) {
+					int b = x | (yy << 6) | (zz << 12);
+					Arrays.fill(out, b, b + size, id);
+				}
+			return;
+		}
+		int h = size >> 1;
+		for (int i = 0; i < 8; i++)
+			expand(n[v + i], x + ((i & 1) != 0 ? h : 0), y + ((i & 2) != 0 ? h : 0), z + ((i & 4) != 0 ? h : 0), h, out);
+	}
+}
+
+/** Tiny direct-mapped cache. Each entry is one long: 56 bits of hash tag + an 8-bit payload. Not thread-safe (one per Render). */
+final class Memo {
+	private static final long K1 = 0x9E3779B97F4A7C15L, K2 = 0xC2B2AE3D27D4EB4FL, K3 = 0x165667B19E3779F9L, K4 = 0x27D4EB2F165667C5L;
+	final long[] t;
+	final int mask;
+
+	Memo(int size) { t = new long[size]; mask = size - 1; } // size must be a power of two
+
+	static long hash(long a, long b, long c, long d) {
+		long h = a * K1;
+		h = (h ^ (h >>> 29)) + b * K2;
+		h = (h ^ (h >>> 29)) + c * K3;
+		h = (h ^ (h >>> 29)) + d * K4;
+		h ^= h >>> 32; h *= 0xD6E8FEB86659FD93L; h ^= h >>> 32;
+		return h | 0x100L; // tag is never 0, so an empty slot can't match
+	}
+
+	/** Payload 0..255, or -1 on a miss. */
+	int get(long h) {
+		long e = t[(int) (h >>> 20) & mask];
+		return ((e ^ h) & ~0xFFL) == 0 ? (int) (e & 0xFF) : -1;
+	}
+
+	void put(long h, int v) { t[(int) (h >>> 20) & mask] = (h & ~0xFFL) | v; }
+
+	void clear() { Arrays.fill(t, 0L); }
 }
