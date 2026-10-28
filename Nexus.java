@@ -33,9 +33,8 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	static volatile SplitDecimal[] hudPos = { new SplitDecimal(), new SplitDecimal(), new SplitDecimal() }; // EDT-safe snapshot
 	static double velX, velY, velZ, yaw = 1.2, pitch, fov = 90, focal = 160, sinYaw, sinPitch, cosYaw, cosPitch, amp = 1, flight = 0.1, sensitivity = Math.PI / 1800;
 	volatile static boolean vSync = true, caves = true, terrain3D = true, degrees, lock, focus, inside, update = true, sprint, fly, fill, display = true, classic = true, xor, sprintRequest, showFPS = true, showXYZ = true, showRot = true, showCyan = true, showMagenta = true, showExtra = true, freezeTime = false;
-	static volatile boolean mouseLookArmed = false;
+	static volatile boolean mouseLookArmed = false, worldLoading = false;
 	static volatile int mouseButtonsDown = 0;
-	static volatile boolean worldLoading = false;
 	static long worldLoadReadyAt = 0L;
 	public static byte scale = 1, detail = 1, option, heldBlock, reach = 5, power = 5;
 	final static int SIZE = 64, SHIFT = 6, MASK = 63, VOL = SIZE * SIZE * SIZE;
@@ -43,7 +42,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	static int width = 1280, height = 960, resX = 1, resY = 1;
 	final static int THREADS = Math.max(1, Runtime.getRuntime().availableProcessors());
 	final static int RENDER_THREADS = Math.max(1, Math.min(8, THREADS - 2));
-	final static int GEN_THREADS = Math.max(1, Math.min(2, THREADS - RENDER_THREADS - 1));
+	final static int GEN_THREADS = Math.max(2, Math.min(4, THREADS / 2));
 	static final long NO_POS = Long.MIN_VALUE;
 	volatile static long focusTime, hoveredX = NO_POS, hoveredY = NO_POS, hoveredZ = NO_POS, newHoverX = NO_POS, newHoverY = NO_POS, newHoverZ = NO_POS;
 	volatile static int dirX, dirY, dirZ, newDirX, newDirY, newDirZ;
@@ -52,7 +51,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	final static int MAGIC = 0x4E585338; // "NXS8"
 	static final double[] PERLIN = new double[perlinRes + 1];
 	static volatile byte[] hotbar = new byte[]{};
-	public static String VERSION = "2.5";
+	public static String VERSION = "2.5.1";
 	volatile static String hoveredType;
 	static Vec3 light = new Vec3(0), sunColor = new Vec3(0), ambColor = new Vec3(0), skyColor = new Vec3(0);
 	static final Vec3 SUN_LOW = new Vec3(1, 0.5, 0), SUN_DAY = new Vec3(1), SUN_NIGHT = new Vec3(0.3, 0.3, 0.5);
@@ -144,23 +143,21 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	static final ExecutorService genPool = Executors.newFixedThreadPool(GEN_THREADS, r -> {
 		Thread t = new Thread(r, "nexus-gen");
 		t.setDaemon(true);
-		t.setPriority(2);
+		t.setPriority(3);
 		return t;
 	});
-
-	static final class GenBatch {
-		final long[][] coords;
-		final List<Future<Octree>> futures;
-		final boolean[] runFeatures;
-		final boolean[] cachedRestore;
-		final int epoch;
-		GenBatch(long[][] coords, List<Future<Octree>> futures, boolean[] runFeatures, boolean[] cachedRestore, int epoch) {
-			this.coords = coords; this.futures = futures; this.runFeatures = runFeatures;
-			this.cachedRestore = cachedRestore; this.epoch = epoch;
-		}
+	static final class GenJob {
+	    final long cx, cy, cz, key;
+	    final Future<Octree> future;
+	    final boolean features, cached;
+	    final int epoch;
+	    GenJob(long cx, long cy, long cz, long key, Future<Octree> future, boolean features, boolean cached, int epoch) {
+	        this.cx = cx; this.cy = cy; this.cz = cz; this.key = key; this.future = future;
+	        this.features = features; this.cached = cached; this.epoch = epoch;
+	    }
 	}
-
-	static GenBatch inFlight;
+	static final ArrayDeque<GenJob> jobs = new ArrayDeque<>();
+	static final HashSet<Long> jobKeys = new HashSet<>();
 	static final ArrayDeque<long[]> featureQueue = new ArrayDeque<>();
 	static int featureEpoch;
 	static final long FEATURE_BUDGET_NS = 4_000_000L; // max feature-pass time per frame
@@ -182,7 +179,9 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	static int page;
 	static boolean titleIdle;
 	static int zoomWidth = -1;
-	static final int MAX_LOAD_PER_PASS = 64;
+	static final int MAX_LOAD_PER_PASS = 96;
+	static final int MAX_IN_FLIGHT = GEN_THREADS * 12;
+	static final long INSTALL_BUDGET_NS = 3_000_000L; // max time per frame spent installing finished chunks
 	final static byte AIR = 0, GRASS = 1, DIRT = 2, STONE = 3, BRICKS = 4, OAK_LOG = 5, LEAVES = 6, GLASS = 7,
 			SLATE = 8, DYNAMITE = 9, SNOW = 10, MAGMA = 11, SAND = 12, ICE = 13, TOPAZ = 14, EMERALD = 15,
 			RUBY = 16, SAPPHIRE = 17, AMETHYST = 18, COPPER = 19, IRON_ORE = 20, COPPER_ORE = 21, COAL_ORE = 22,
@@ -537,9 +536,29 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		chunkDirty = true;
 	}
 	static final Map<Long, LinkedHashSet<Long>> pendingWrites = new LinkedHashMap<>();
-	static final int PENDING_MAX = 1_000_000;
+	static final int DEEP_NEAR = 12, DEEP_NEAR2 = DEEP_NEAR * DEEP_NEAR; // chunks: full-depth loading inside this horizontal radius
+	static final double DEEP_CULL_MIX = 0.5;       // caveMix below this = player is on the surface, so cull deep far chunks
+	static final int UNDERGROUND_RADIUS_CAP = 24;  // chunks; underground fog hides anything farther
+	static final int INSTANT_MAX = 8192;           // empty sky chunks installed per pass without a worker job
+	static final int PENDING_MAX = 250_000;        // was 1_000_000 (boxed Longs in LinkedHashSets are heavy)
+
+	/** Lowest y (largest, +y is down) that a surface can reach, plus margin. Chunks deeper than this are invisible from afar. */
+	static long surfaceBottom() {
+	    if (terrain3D) return (long) Math.ceil(TBASE + 0.5 * TK * Math.abs(amp) * TDIV) + 96;
+	    return (long) Math.ceil(Math.max(127 * amp, (127 + 100 * amp) * amp)) + 96;
+	}
+
+	/** Should this chunk be loaded right now? Same rule for loading, unloading and the feature-neighbour check. */
+	static boolean wantedAt(long nx, long ny, long nz, long pcx, long pcy, long pcz, int er, boolean cull, long bottom) {
+	    long dx = wrap21(nx - pcx), dy = wrap21(ny - pcy), dz = wrap21(nz - pcz);
+	    if (dx * dx + dy * dy + dz * dz > (long) er * er) return false;
+	    if (!cull || dx * dx + dz * dz <= DEEP_NEAR2) return true;
+	    return ny * SIZE <= bottom;
+	}
 
 	public static void main(String[] args) {
+		deleteStaleTmp();
+		deleteOrphanBackups();
 		Runtime.getRuntime().addShutdownHook(new Thread(Nexus::saveOnShutdown, "nexus-shutdown-save"));
 		frame = new JFrame("Bitwise Nexus " + VERSION);
 		Nexus nexus = new Nexus();
@@ -615,9 +634,10 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		return true;
 	}
 
-	/** Underground fog is opaque by dist / 1.5, so far chunks cannot be seen. */
 	static int effectiveRadius() {
-		return caveMix > 0.95 ? Math.max(1, Math.min(radius, (int) Math.ceil(dist / (1.5 * SIZE)))) : radius;
+	    if (caveMix <= 0.95) return radius;
+	    int fogR = (int) Math.ceil(dist / (1.5 * SIZE));
+	    return Math.max(1, Math.min(Math.min(radius, UNDERGROUND_RADIUS_CAP), fogR));
 	}
 
 	static void updateCaveMix() {
@@ -677,7 +697,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	}
 
 	/** Wrappers so Fog (a separate class) can reach the private noise helpers. */
-	static double biomeVal(double wx, double wz) { return noise(wx / 512.0, wz / 512.0); }
+	static double biomeVal(double wx, double wz) { return biomeAt(wx, wz); }
 	static double zone(int biome, long x, long y, long z) { return zoneAt(biome, x, y, z); }
 
 	private static int[] dataOf(BufferedImage img) {
@@ -1508,13 +1528,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 
 				    long elapsedNs = lastMenuFrameNs == 0L ? 0L : nowNs - lastMenuFrameNs;
 				    lastMenuFrameNs = nowNs;
-
-				    // Keep the title-screen preview airborne and fixed in place.
-				    fly = true;
-				    x.setValue(15493); y.setValue(96); z.setValue(17236);
-				    velX = velY = velZ = 0;
-				    pitch = -2.0 / 3.0;
-
+				    mainMenuPosition(false, false);
 				    double deltaSeconds = Math.min(elapsedNs / 1E9, 0.1);
 				    yaw += 0.1 * deltaSeconds;
 				}
@@ -1605,6 +1619,15 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		} catch (HeadlessException e) {
 			e.printStackTrace();
 		}
+	}
+
+	private static void mainMenuPosition(boolean resetYaw, boolean resetDist) {
+		fly = true;
+		velX = velY = velZ = 0;
+	    x.setValue(15493); y.setValue(96); z.setValue(17236);
+	    pitch = -2.0 / 3.0;
+	    if (resetYaw) yaw = 1.2;
+	    if (resetDist) setDist(368);
 	}
 
 	static boolean computeIdle() {
@@ -1726,11 +1749,23 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	// ---- skip rendering when nothing visible changed ----
 	private static long lastSig, lastSigTime;
 	private static boolean sigValid;
+	static boolean shadowRetry;
+	static long lastHealTime;
 
 	private static long sigMix(long h, long v) { h = (h ^ v) * 0x9E3779B97F4A7C15L; return h ^ (h >>> 31); }
 
 	private static boolean sceneUnchanged() {
 		if (Render.warmIncomplete || Particles.count != 0) { sigValid = false; return false; }
+		if (Render.shadowProvisional) {
+		    Render.shadowProvisional = false;
+		    shadowRetry = true;
+		}
+		if (shadowRetry && jobs.isEmpty() && featureQueue.isEmpty()) {
+		    shadowRetry = false;
+		    worldVer++;
+		    sigValid = false;
+		    return false;
+		}
 		long h = 7;
 		h = sigMix(h, viewX.hashCode()); h = sigMix(h, viewY.hashCode()); h = sigMix(h, viewZ.hashCode());
 		h = sigMix(h, Double.doubleToLongBits(yaw)); h = sigMix(h, Double.doubleToLongBits(pitch));
@@ -1743,6 +1778,12 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		h = sigMix(h, Double.doubleToLongBits(red)); h = sigMix(h, Double.doubleToLongBits(green)); h = sigMix(h, Double.doubleToLongBits(blue));
 		h = sigMix(h, Math.round(caveMix * 1000));
 		h = sigMix(h, breakStage + 1L); h = sigMix(h, breakX ^ (breakY * 31) ^ (breakZ * 131));
+		if (time - lastHealTime >= 20) {
+		    lastHealTime = time;
+		    worldVer++;
+		    sigValid = false;
+		    return false;
+		}
 		boolean same = sigValid && h == lastSig && Math.abs(time - lastSigTime) < 25; // sun moves ~0.3° per 25 ticks
 		if (!same) { lastSig = h; lastSigTime = time; sigValid = true; }
 		return same;
@@ -1918,27 +1959,28 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	}
 
 	static double estimateGround(long bx, long bz) {
-		if (terrain3D) {
-			double half = 0.5 * TK * Math.abs(amp) * TDIV;
-			double lo = Math.floor(TBASE - half) - 1, hi = Math.ceil(TBASE + half) + 1;
-			final int N = 4096;
-			double prev = lo;
-			for (int i = 0; i <= N; i++) {
-				double yy = lo + (hi - lo) * i / N;
-				if (density(bx, yy, bz) > 0) {
-					double a = prev, b = yy;
-					for (int k = 0; k < 64 && b - a > 1; k++) {
-						double m = Math.floor(a + (b - a) / 2);
-						if (m <= a) break;
-						if (density(bx, m, bz) > 0) b = m; else a = m;
-					}
-					return b - 1.54;
-				}
-				prev = yy;
-			}
-			return TBASE - 1.54;
-		}
-		return terrainHeight(bx, bz) - 1.54;
+	    if (terrain3D) {
+	        double half = 0.5 * TK * Math.abs(amp) * TDIV;
+	        double lift = mountainLift(bx, bz), plains = plainsAt(bx, bz);
+	        double lo = Math.floor(TBASE - half - lift) - 1, hi = Math.ceil(TBASE + half) + 1;
+	        final int N = 4096;
+	        double prev = lo;
+	        for (int i = 0; i <= N; i++) {
+	            double yy = lo + (hi - lo) * i / N;
+	            if (density(bx, yy, bz, plains, lift) > 0) {
+	                double a = prev, b = yy;
+	                for (int k = 0; k < 64 && b - a > 1; k++) {
+	                    double m = Math.floor(a + (b - a) / 2);
+	                    if (m <= a) break;
+	                    if (density(bx, m, bz, plains, lift) > 0) b = m; else a = m;
+	                }
+	                return b - 1.54;
+	            }
+	            prev = yy;
+	        }
+	        return TBASE - 1.54;
+	    }
+	    return terrainHeight(bx, bz) - 1.54;
 	}
 
 	static long terrainHeight(long wx, long wz) {
@@ -1946,12 +1988,12 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	}
 
 	static long topBound() {
-		if (terrain3D) {
-			double half = 0.5 * TK * Math.abs(amp) * TDIV;
-			return (long) Math.floor(TBASE - half) - 32; // margin for trees/spires/icicles
-		}
-		double a = 127 * amp, b = (127 + 100 * amp) * amp;
-		return (long) Math.floor(Math.min(a, b)) - 32;
+	    if (terrain3D) {
+	        double half = 0.5 * TK * Math.abs(amp) * TDIV;
+	        return (long) Math.floor(TBASE - half - MTN_H) - 32;
+	    }
+	    double a = 127 * amp, b = (127 + 100 * amp) * amp;
+	    return (long) Math.floor(Math.min(a, b)) - 32;
 	}
 
 	private static double noise(double x, double y) {
@@ -2020,11 +2062,15 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		return (d << 43) >> 43;
 	}
 
-	private static boolean featureNeighboursReady(long cx, long cy, long cz) {
+	private static boolean featureNeighboursReady(long cx, long cy, long cz, long pcx, long pcy, long pcz, int er, boolean cull, long bottom) {
 	    for (byte dx = -1; dx <= 1; dx++)
 	        for (byte dy = -1; dy <= 1; dy++)
-	            for (byte dz = -1; dz <= 1; dz++)
-	                if (!world.has(cx + dx, cy + dy, cz + dz)) return false;
+	            for (byte dz = -1; dz <= 1; dz++) {
+	                long nx = cx + dx, ny = cy + dy, nz = cz + dz;
+	                if (world.has(nx, ny, nz)) continue;
+	                if (!wantedAt(nx, ny, nz, pcx, pcy, pcz, er, cull, bottom)) continue;
+	                return false;
+	            }
 	    return true;
 	}
 
@@ -2034,7 +2080,11 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	        featureEpoch = world.epoch;
 	        return;
 	    }
-	    long end = System.nanoTime() + FEATURE_BUDGET_NS;
+	    final long pcx = chunkOf(x), pcy = chunkOf(y), pcz = chunkOf(z);
+	    final int er = effectiveRadius();
+	    final boolean cull = caveMix < DEEP_CULL_MIX;
+	    final long bottom = surfaceBottom();
+	    long end = System.nanoTime() + (featureQueue.size() > 32 ? FEATURE_BUDGET_NS * 2 : FEATURE_BUDGET_NS);
 	    int scan = Math.min(featureQueue.size(), 256); // entries that must keep waiting rotate to the back
 	    generating = true;
 	    try {
@@ -2042,13 +2092,15 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	            long[] m = featureQueue.poll();
 	            if (m == null) break;
 	            if (!world.has(m[0], m[1], m[2])) continue; // unloaded while waiting; a reload queues it again
-	            if (!featureNeighboursReady(m[0], m[1], m[2])) { featureQueue.add(m); continue; }
+	            if (!featureNeighboursReady(m[0], m[1], m[2], pcx, pcy, pcz, er, cull, bottom)) { featureQueue.add(m); continue; }
 	            homeKey = World.key(m[0], m[1], m[2]);
 	            features(m[0], m[1], m[2]);
 	            autumnForestFeatures(m[0], m[1], m[2]);
 	            caveFeatures(m[0], m[1], m[2]);
 	            basinFeatures(m[0], m[1], m[2]);
 	            mengerSpongeFeatures(m[0], m[1], m[2]);
+	            Octree hc = world.chunk(m[0], m[1], m[2]);
+	            if (hc != null && hc != World.UNLOADED && !hc.shared) hc.compact();
 	            // Replay cross-chunk feature writes immediately for already-loaded neighbors;
 	            // otherwise tree canopies and other features can be clipped at chunk borders.
 	            for (long dx = -1; dx <= 1; dx++) for (long dy = -1; dy <= 1; dy++) for (long dz = -1; dz <= 1; dz++) {
@@ -2071,12 +2123,13 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	    if (!force && now - lastChunkCleanup < 1000L) return;
 	    lastChunkCleanup = now;
 	    long cx = chunkOf(x), cy = chunkOf(y), cz = chunkOf(z);
-	    long r2 = (long) radius * radius, cutoff = force ? Long.MAX_VALUE : now - 10000;
+	    long cutoff = force ? Long.MAX_VALUE : now - 10000;
+	    final boolean cull = caveMix < DEEP_CULL_MIX;
+	    final long bottom = surfaceBottom();
 	    for (int s = 0; s < world.keys.length; s++) {
 	        long k = world.keys[s];
 	        if (k == World.NONE || world.seen[s] >= cutoff) continue;
-	        long dx = wrap21(World.unpackX(k) - cx), dy = wrap21(World.unpackY(k) - cy), dz = wrap21(World.unpackZ(k) - cz);
-	        if (dx * dx + dy * dy + dz * dz > r2)
+	        if (!wantedAt(World.unpackX(k), World.unpackY(k), World.unpackZ(k), cx, cy, cz, radius, cull, bottom))
 	            unloadSlot(s);
 	    }
 	    prunePending(cx, cy, cz, force);
@@ -2099,40 +2152,39 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	    }
 	}
 
-	private static boolean collectBatch() {
-		GenBatch b = inFlight;
-		for (Future<Octree> f : b.futures)
-			if (!f.isDone())
-				return false;
-		inFlight = null;
-		chunkDirty = true;
-		if (b.epoch != world.epoch)
-			return true;
-		if (featureEpoch != world.epoch) {
-			featureQueue.clear();
-			featureEpoch = world.epoch;
-		}
-		long pcx = chunkOf(x), pcy = chunkOf(y), pcz = chunkOf(z), r2 = (long) radius * radius;
-		for (int i = 0; i < b.coords.length; i++) {
-			long[] m = b.coords[i];
-			long dx = m[0] - pcx, dy = m[1] - pcy, dz = m[2] - pcz;
-			if (dx * dx + dy * dy + dz * dz > r2)
-				continue;
-			Octree d = null;
-			try {
-				d = b.futures.get(i).get();
-			} catch (Exception e) {
-				e.printStackTrace();
-			}
-			int slot = world.slot(m[0], m[1], m[2]);
-			unloadSlot(slot);
-			world.put(m[0], m[1], m[2], d);
-			if (d != null) userTopY = Math.min(userTopY, m[1] * SIZE);
-			if (b.cachedRestore[i]) world.dirty[slot] = true;
-			if (b.runFeatures[i]) applyPending(m[0], m[1], m[2]);
-			if (b.runFeatures[i]) featureQueue.add(m);
-		}
-		return true;
+	/** Installs every finished chunk (nearest first) within a small time budget; drops stale/far jobs. */
+	private static void drainFinished() {
+	    if (jobs.isEmpty()) return;
+	    if (featureEpoch != world.epoch) { featureQueue.clear(); featureEpoch = world.epoch; }
+	    final long end = System.nanoTime() + INSTALL_BUDGET_NS;
+	    final long pcx = chunkOf(x), pcy = chunkOf(y), pcz = chunkOf(z), r2 = (long) radius * radius;
+	    boolean any = false;
+	    for (Iterator<GenJob> it = jobs.iterator(); it.hasNext();) {
+	        GenJob j = it.next();
+	        if (j.epoch != world.epoch) { j.future.cancel(true); it.remove(); jobKeys.remove(j.key); continue; }
+	        long dx = j.cx - pcx, dy = j.cy - pcy, dz = j.cz - pcz;
+	        boolean far = dx * dx + dy * dy + dz * dz > r2;
+	        if (!j.future.isDone()) {
+	            if (far) { j.future.cancel(false); it.remove(); jobKeys.remove(j.key); }
+	            continue;
+	        }
+	        if (System.nanoTime() >= end) break;
+	        it.remove(); jobKeys.remove(j.key);
+	        any = true;
+	        if (far) continue;
+	        Octree d = null;
+	        try { d = j.future.get(); } catch (Exception e) { e.printStackTrace(); }
+	        int slot = world.slot(j.cx, j.cy, j.cz);
+	        unloadSlot(slot);
+	        world.put(j.cx, j.cy, j.cz, d);
+	        if (d != null) userTopY = Math.min(userTopY, j.cy * SIZE);
+	        if (j.cached) world.dirty[slot] = true;
+	        if (j.features) {
+	            applyPending(j.cx, j.cy, j.cz);
+	            featureQueue.add(new long[] { j.cx, j.cy, j.cz });
+	        }
+	    }
+	    if (any) chunkDirty = true;
 	}
 
 	/** Chunk offsets inside the load sphere, nearest first, packed as three biased bytes. */
@@ -2174,89 +2226,133 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	}
 
 	private static void ensureChunks() {
-		runFeatureQueue();
-		if (inFlight != null && !collectBatch())
-			return;
+	    runFeatureQueue();
+	    drainFinished();
+	    final int room = Math.min(MAX_LOAD_PER_PASS, MAX_IN_FLIGHT - jobs.size());
+	    if (room <= 0) return;
 
-		long cx = chunkOf(x), cy = chunkOf(y), cz = chunkOf(z);
-		int er = effectiveRadius();
-		if (!chunkDirty && cx == lcx && cy == lcy && cz == lcz && er == lastLoadRadius)
-			return;
-		chunkDirty = false;
-		lcx = cx; lcy = cy; lcz = cz;
-		lastLoadRadius = er;
+	    long cx = chunkOf(x), cy = chunkOf(y), cz = chunkOf(z);
+	    int er = effectiveRadius();
+	    if (!chunkDirty && cx == lcx && cy == lcy && cz == lcz && er == lastLoadRadius)
+	        return;
+	    chunkDirty = false;
+	    lcx = cx; lcy = cy; lcz = cz;
+	    lastLoadRadius = er;
 
-		int[] order = loadOrder(er);
-		if (CAND.length < order.length) CAND = new long[order.length];
-		final long[] cand = CAND;
-		final double fx = cosPitch * sinYaw, fy = -sinPitch, fz = cosPitch * cosYaw; // look direction
-		int m = 0;
-		for (int i = 0; i < order.length; i++) {
-			int o = order[i];
-			int dx = (o & 255) - 128, dy = ((o >> 8) & 255) - 128, dz = ((o >> 16) & 255) - 128;
-			if (world.has(cx + dx, cy + dy, cz + dz))
-				continue;
-			double d2 = dx * dx + dy * dy + dz * dz, len = Math.sqrt(d2);
-			double facing = len == 0 ? 1 : (dx * fx + dy * fy + dz * fz) / len; // 1 ahead, -1 behind
-			cand[m++] = (long) ((d2 + 6.0 * (1 - facing)) * 16) << 24 | o;      // chunks behind you wait
-		}
-		selectSmallest(cand, m, Math.min(m, MAX_LOAD_PER_PASS));
-		int[] picked = new int[MAX_LOAD_PER_PASS];
-		int n = Math.min(m, MAX_LOAD_PER_PASS);
-		if (m > n)
-			chunkDirty = true;
-		for (int i = 0; i < n; i++)
-			picked[i] = (int) (cand[i] & 0xFFFFFF);
-		if (n == 0)
-			return;
+	    int[] order = loadOrder(er);
+	    if (CAND.length < order.length) CAND = new long[order.length];
+	    final long[] cand = CAND;
+	    final double fx = cosPitch * sinYaw, fy = -sinPitch, fz = cosPitch * cosYaw;
+	    final boolean cull = caveMix < DEEP_CULL_MIX;
+	    final long bottom = surfaceBottom();
+	    final long airLimit = Math.min(topBound(), userTopY) - 160; // chunks entirely above this are guaranteed empty
+	    int m = 0, instant = 0;
+	    long bound16 = Long.MAX_VALUE;
+	    boolean cut = false;
+	    for (int i = 0; i < order.length; i++) {
+	        int o = order[i];
+	        int dx = (o & 255) - 128, dy = ((o >> 8) & 255) - 128, dz = ((o >> 16) & 255) - 128;
+	        double d2 = dx * dx + dy * dy + dz * dz;
+	        if (m >= room && (long) (d2 * 16) > bound16) { cut = true; break; }
+	        final long qx = cx + dx, qy = cy + dy, qz = cz + dz;
+	        if (cull && dx * dx + dz * dz > DEEP_NEAR2 && qy * SIZE > bottom) continue; // deep and far: invisible
+	        if (world.has(qx, qy, qz)) continue;
+	        if (!jobKeys.isEmpty() && jobKeys.contains(World.key(qx, qy, qz))) continue;
+	        if (instant < INSTANT_MAX && qy * SIZE + SIZE - 1 < airLimit && !savedChunks.containsKey(World.key(qx, qy, qz))) {
+	            unloadSlot(world.slot(qx, qy, qz)); // empty sky: no worker job needed
+	            world.put(qx, qy, qz, null);
+	            instant++;
+	            continue;
+	        }
+	        double len = Math.sqrt(d2);
+	        double facing = len == 0 ? 1 : (dx * fx + dy * fy + dz * fz) / len;
+	        cand[m++] = (long) ((d2 + 6.0 * (1 - facing)) * 16) << 24 | o;
+	        if (m == room) {
+	            long mx = 0;
+	            for (int k = 0; k < m; k++) mx = Math.max(mx, cand[k] >>> 24);
+	            bound16 = mx;
+	        }
+	    }
+	    if (instant >= INSTANT_MAX) chunkDirty = true;
+	    final int n = Math.min(m, room);
+	    selectSmallest(cand, m, n);
+	    if (m > n || cut) chunkDirty = true;
+	    if (n == 0) return;
 
-		long[][] coords = new long[n][];
-		List<Future<Octree>> futures = new ArrayList<>(n);
-		boolean[] featurePass = new boolean[n], cacheRestore = new boolean[n];
-		for (int i = 0; i < n; i++) {
-			int o = picked[i];
-			long qx = cx + (o & 255) - 128, qy = cy + ((o >> 8) & 255) - 128, qz = cz + ((o >> 16) & 255) - 128;
-			long key = World.key(qx, qy, qz);
-			Object saved = savedChunks.get(key);
-			boolean cached = false;
-			if (saved == null && (saved = chunkCache.remove(key)) != null) {
-				cacheBytes -= sizeOf(saved);
-				cached = true;
-			}
-			final Object restoreValue = saved;
-			final long[] coord = { qx, qy, qz };
-			coords[i] = coord;
-			if (restoreValue != null) {
-				futures.add(genPool.submit(() -> restore(restoreValue)));
-				cacheRestore[i] = cached;
-			} else {
-				futures.add(genPool.submit(() -> generate(coord[0], coord[1], coord[2])));
-				featurePass[i] = true;
-			}
-		}
-		inFlight = new GenBatch(coords, futures, featurePass, cacheRestore, world.epoch);
+	    final int epoch = world.epoch;
+	    for (int i = 0; i < n; i++) {
+	        int o = (int) (cand[i] & 0xFFFFFF);
+	        final long qx = cx + (o & 255) - 128, qy = cy + ((o >> 8) & 255) - 128, qz = cz + ((o >> 16) & 255) - 128;
+	        final long key = World.key(qx, qy, qz);
+	        Object saved = savedChunks.get(key);
+	        boolean cached = false;
+	        if (saved == null && (saved = chunkCache.remove(key)) != null) {
+	            cacheBytes -= sizeOf(saved);
+	            cached = true;
+	        }
+	        final Object restoreValue = saved;
+	        Future<Octree> f;
+	        boolean features;
+	        if (restoreValue != null) {
+	            f = genPool.submit(() -> restore(restoreValue));
+	            features = false;
+	        } else {
+	            f = genPool.submit(() -> generate(qx, qy, qz));
+	            features = true;
+	        }
+	        jobs.add(new GenJob(qx, qy, qz, key, f, features, cached, epoch));
+	        jobKeys.add(key);
+	    }
 	}
 
 	static final double TBASE = 160, TDIV = 24, TK = 10;
+	static final double MTN_H = 512, MTN_SCALE = 2048, MTN_LO = 0.7, MTN_HI = 0.8;
 
 	static double plainsAt(double wx, double wz) {
 		return smoothstep(0.58, 0.82, noise3(wx / 800.0, 0, wz / 800.0, 0x71));
 	}
 
-	static double density(double wx, double wy, double wz) {
-		return density(wx, wy, wz, plainsAt(wx, wz));
+	/** Raw mountain-region noise; 0.86+ only happens in a few spots (thousands of blocks wide). */
+	static double mountainRaw(double wx, double wz) {
+	    return noise3(wx / MTN_SCALE, 0, wz / MTN_SCALE, 0x6D);
 	}
 
-	static double density(double wx, double wy, double wz, double plains) {
-		double rough = 0, flat = 0;
-		if (plains < 1.0)
-			rough = 0.50 * noise3(wx / 180.0, wy / 150.0, wz / 180.0, 0x11)
-				  + 0.30 * noise3(wx / 64.0,  wy / 56.0,  wz / 64.0,  0x22)
-				  + 0.20 * noise3(wx / 24.0,  wy / 28.0,  wz / 24.0,  0x33);
-		if (plains > 0.0)
-			flat = 0.5 + 0.055 * noise3(wx / 300.0, wy / 240.0, wz / 300.0, 0x91);
-		double terrainNoise = rough * (1.0 - plains) + flat * plains;
-		return (wy - TBASE) / TDIV + TK * amp * (terrainNoise - 0.5);
+	/** Cheap chunk-level test: the noise is so smooth that 0.06 of margin covers a whole chunk. */
+	static boolean mountainNear(double wx, double wz) {
+	    return mountainRaw(wx, wz) >= MTN_LO - 0.06;
+	}
+
+	/** Blocks the terrain is raised at this column (0 .. MTN_H). */
+	static double mountainLift(double wx, double wz) {
+	    double m = smoothstep(MTN_LO, MTN_HI, mountainRaw(wx, wz));
+	    if (m <= 0) return 0;
+	    double ridge = 1 - Math.abs(2 * noise3(wx / 450.0, 0, wz / 450.0, 0x6E) - 1); // ridged peaks
+	    double detail = noise3(wx / 90.0, 0, wz / 90.0, 0x6F);
+	    return MTN_H * m * (0.30 + 0.60 * ridge * ridge + 0.10 * detail);
+	}
+
+	/** Biome noise with mountain regions pulled into the snowy range (1.4..1.85). */
+	static double biomeAt(double wx, double wz) {
+	    double v = noise(wx / 512.0, wz / 512.0);
+	    if (!terrain3D) return v;
+	    double m = smoothstep(MTN_LO, MTN_HI, mountainRaw(wx, wz));
+	    return m <= 0 ? v : v + (1.6 - v) * m;
+	}
+
+	static double density(double wx, double wy, double wz) {
+	    return density(wx, wy, wz, plainsAt(wx, wz), mountainLift(wx, wz));
+	}
+
+	static double density(double wx, double wy, double wz, double plains, double lift) {
+	    double rough = 0, flat = 0;
+	    if (plains < 1.0)
+	        rough = 0.50 * noise3(wx / 180.0, wy / 150.0, wz / 180.0, 0x11)
+	              + 0.30 * noise3(wx / 64.0,  wy / 56.0,  wz / 64.0,  0x22)
+	              + 0.20 * noise3(wx / 24.0,  wy / 28.0,  wz / 24.0,  0x33);
+	    if (plains > 0.0)
+	        flat = 0.5 + 0.055 * noise3(wx / 300.0, wy / 240.0, wz / 300.0, 0x91);
+	    double terrainNoise = rough * (1.0 - plains) + flat * plains;
+	    return (wy - TBASE) / TDIV + TK * amp * (terrainNoise - 0.5) + lift / TDIV;
 	}
 
 	static double smoothstep(double edge0, double edge1, double x) {
@@ -2266,111 +2362,132 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	}
 
 	private static Octree generate(long cx, long cy, long cz) {
-		byte[] data = terrain3D ? generate3D(cx, cy, cz) : generate2D(cx, cy, cz);
-		if (data == null)
-			return null;
-		if (caves) {
-			carveCaves(data, cx, cy, cz);
-			carveBasins(data, cx, cy, cz);
-		}
-		placeOres(data, cx, cy, cz);
-		return Octree.build(data);
+	    byte[] data = terrain3D ? generate3D(cx, cy, cz) : generate2D(cx, cy, cz);
+	    if (data != null) {
+	        if (caves) {
+	            carveCaves(data, cx, cy, cz);
+	            carveBasins(data, cx, cy, cz);
+	        }
+	        placeOres(data, cx, cy, cz);
+	    }
+	    final long cells = PYR_CELL / SIZE; // chunks per cell edge
+	    PyramidSite pyr = pyramidSite(Math.floorDiv(cx, cells), Math.floorDiv(cz, cells));
+	    if (pyr != null) data = stampPyramid(data, pyr, cx, cy, cz);
+	    return data == null ? null : Octree.build(data);
 	}
 
-	/**
-	 * 3D terrain. Density is sampled on a 4-block lattice (extended 8 blocks above the chunk so surface depth is
-	 * known at the top edge) and interpolated, so a chunk costs ~5.5k noise evaluations instead of 262k.
-	 * A voxel with air above it is the surface block, the next 4 are the sub-surface, then stone/slate/magma by depth.
-	 */
 	private static byte[] generate3D(long cx, long cy, long cz) {
-		boolean layerSet = false;
-		double b1 = 0, b2 = 0;
-		long baseX = cx * SIZE, baseY = cy * SIZE, baseZ = cz * SIZE;
-		double half = 0.5 * TK * Math.abs(amp) * TDIV;
-		if (baseY + SIZE - 1 < TBASE - half)
-			return null; // entirely above the highest possible terrain
-		final int n = CAVE_N, ny = n + 2, nyn = ny * n;
-		float[] g = GEN_G.get();
-		if (baseY - 8 >= TBASE + half) {
-			byte u = uniformLayer(baseY - TBASE, baseY + SIZE - 1 - TBASE);
-			if (u != AIR) {
-				byte[] solid = denseBuf();
-				Arrays.fill(solid, u);
-				return solid;
-			}
-			Arrays.fill(g, 1f);
-		} else {
-			for (int gz = 0; gz < n; gz++)
-				for (int gx = 0; gx < n; gx++) {
-					double wx = baseX + gx * CAVE_STEP, wz = baseZ + gz * CAVE_STEP;
-					double plains = plainsAt(wx, wz);
-					for (int gy = 0; gy < ny; gy++)
-						g[gz * nyn + gy * n + gx] = (float) density(wx, baseY - 8 + gy * CAVE_STEP, wz, plains);
-				}
-		}
-		byte[] data = null;
-		float[] col = GEN_COL.get();
-		for (byte lz = 0; lz < SIZE; lz++) {
-			int kz = lz >> 2;
-			float fz = (lz & 3) * 0.25f;
-			long wz = baseZ + lz;
-			for (byte lx = 0; lx < SIZE; lx++) {
-				int kx = lx >> 2;
-				float fx = (lx & 3) * 0.25f;
-				int base = kz * nyn + kx;
-				boolean any = false;
-				for (byte gy = 0; gy < ny; gy++) {
-					int i = base + gy * n;
-					float a = g[i] + fx * (g[i + 1] - g[i]);
-					float b = g[i + nyn] + fx * (g[i + nyn + 1] - g[i + nyn]);
-					col[gy] = a + fz * (b - a);
-					if (col[gy] > 0) any = true;
-				}
-				if (!any)
-					continue;
-				layerSet = false; // layer1/layer2 depend on (x, z), so recompute for every column
-				boolean biomeSet = false;
-				byte top = GRASS, sub = DIRT;
-				int run = 0; // solid voxels since the last air voxel above
-				for (byte ly = -8; ly < SIZE; ly++) {
-					int t = ly + 8, cell = t >> 2;
-					float d = col[cell] + (t & 3) * 0.25f * (col[cell + 1] - col[cell]);
-					if (d <= 0) {
-						run = 0;
-						continue;
-					}
-					run++;
-					if (ly < 0)
-						continue;
-					byte block;
-					if (run <= 5) {
-						if (!biomeSet) {
-							biomeSet = true;
-							double val = noise((baseX + lx) / 512.0, wz / 512.0);
-							if (val < 0.65) top = sub = SAND;
-							else if (val > 1.4 && val < 1.85) top = sub = SNOW;
-							else if (val > 1.85) top = sub = ICE;
-							else if (isAutumnForest(baseX + lx, wz, val)) top = AUTUMN_GRASS;
-						}
-						block = run == 1 ? top : sub;
-					} else {
-						if (!layerSet) {
-							layerSet = true;
-							b1 = layer1(baseX + lx, wz);
-							b2 = layer2(baseX + lx, wz);
-						}
-						block = layerBlock(baseY + ly - TBASE, b1, b2, (int) (baseX + lx), (int) (baseY + ly), (int) wz);
-					}
-					if (data == null)
-						data = denseBuf();
-					data[lx | (ly << SHIFT) | (lz << 2 * SHIFT)] = block;
-				}
-			}
-		}
-		return data;
+	    boolean layerSet = false;
+	    double b1 = 0, b2 = 0;
+	    long baseX = cx * SIZE, baseY = cy * SIZE, baseZ = cz * SIZE;
+	    double half = 0.5 * TK * Math.abs(amp) * TDIV;
+	    if (baseY + SIZE - 1 < TBASE - half - MTN_H)
+	        return null; // above even the tallest possible mountain
+	    final int n = CAVE_N, ny = n + 2, nyn = ny * n;
+	    float[] g = GEN_G.get();
+	    double[] lift = GEN_LIFT.get();
+	    double maxLift = 0;
+	    final boolean nearMtn = maxLift > 0;
+	    if (mountainNear(baseX + SIZE / 2.0, baseZ + SIZE / 2.0)) {
+	        for (int gz = 0; gz < n; gz++)
+	            for (int gx = 0; gx < n; gx++) {
+	                double l = mountainLift(baseX + gx * CAVE_STEP, baseZ + gz * CAVE_STEP);
+	                lift[gz * n + gx] = l;
+	                if (l > maxLift) maxLift = l;
+	            }
+	    } else Arrays.fill(lift, 0.0);
+	    if (baseY + SIZE - 1 < TBASE - half - maxLift)
+	        return null; // entirely above the highest terrain in this chunk
+	    if (baseY - 8 >= TBASE + half) {
+	        byte u = uniformLayer(baseY - TBASE, baseY + SIZE - 1 - TBASE);
+	        if (u != AIR) {
+	            byte[] solid = denseBuf();
+	            Arrays.fill(solid, u);
+	            return solid;
+	        }
+	        Arrays.fill(g, 1f);
+	    } else {
+	        for (int gz = 0; gz < n; gz++)
+	            for (int gx = 0; gx < n; gx++) {
+	                double wx = baseX + gx * CAVE_STEP, wz = baseZ + gz * CAVE_STEP;
+	                double plains = plainsAt(wx, wz), l = lift[gz * n + gx];
+	                for (int gy = 0; gy < ny; gy++)
+	                    g[gz * nyn + gy * n + gx] = (float) density(wx, baseY - 8 + gy * CAVE_STEP, wz, plains, l);
+	            }
+	    }
+	    byte[] data = null;
+	    float[] col = GEN_COL.get();
+	    for (byte lz = 0; lz < SIZE; lz++) {
+	        int kz = lz >> 2;
+	        float fz = (lz & 3) * 0.25f;
+	        long wz = baseZ + lz;
+	        for (byte lx = 0; lx < SIZE; lx++) {
+	            int kx = lx >> 2;
+	            float fx = (lx & 3) * 0.25f;
+	            final double colLift = lift[kz * n + kx];
+	            int base = kz * nyn + kx;
+	            boolean any = false;
+	            for (byte gy = 0; gy < ny; gy++) {
+	                int i = base + gy * n;
+	                float a = g[i] + fx * (g[i + 1] - g[i]);
+	                float b = g[i + nyn] + fx * (g[i + nyn + 1] - g[i + nyn]);
+	                col[gy] = a + fz * (b - a);
+	                if (col[gy] > 0) any = true;
+	            }
+	            if (!any)
+	                continue;
+	            layerSet = false;
+	            boolean biomeSet = false;
+	            byte top = GRASS, sub = DIRT;
+	            int run = 0;
+	            final double wob = colLift > 1 ? (noise3((baseX + lx) / 60.0, 0, wz / 60.0, 0x70) - 0.5) * 50 : 0;
+	            for (byte ly = -8; ly < SIZE; ly++) {
+	                int t = ly + 8, cell = t >> 2;
+	                float d = col[cell] + (t & 3) * 0.25f * (col[cell + 1] - col[cell]);
+	                if (d <= 0) {
+	                    run = 0;
+	                    continue;
+	                }
+	                run++;
+	                if (ly < 0)
+	                    continue;
+	                byte block;
+	                if (run <= 5) {
+	                    if (!biomeSet) {
+	                        biomeSet = true;
+	                        double val = nearMtn ? biomeAt(baseX + lx, wz) : noise((baseX + lx) / 512.0, wz / 512.0);
+	                        if (val < 0.65) top = sub = SAND;
+	                        else if (val > 1.4 && val < 1.85) top = sub = SNOW;
+	                        else if (val > 1.85) top = sub = ICE;
+	                        else if (isAutumnForest(baseX + lx, wz, val)) top = AUTUMN_GRASS;
+	                    }
+	                    byte tp = top, sb = sub;
+	                    if (colLift > 1) { // mountain: stone patches fade in, then snow fades in on top
+	                        double alt = TBASE - (baseY + ly) + wob; // blocks above the base level
+	                        double snowP = smoothstep(0.38 * MTN_H, 0.52 * MTN_H, alt);
+	                        double rockP = smoothstep(0.20 * MTN_H, 0.34 * MTN_H, alt);
+	                        int hx = (int) (baseX + lx), hy = (int) (baseY + ly), hz = (int) wz;
+	                        if (hash3(hx, hy, hz, 0x72) < snowP) tp = sb = SNOW;
+	                        else if (hash3(hx, hy, hz, 0x73) < rockP) tp = sb = STONE;
+	                    }
+	                    block = run == 1 ? tp : sb;
+	                } else {
+	                    if (!layerSet) {
+	                        layerSet = true;
+	                        b1 = layer1(baseX + lx, wz);
+	                        b2 = layer2(baseX + lx, wz);
+	                    }
+	                    block = layerBlock(baseY + ly - TBASE, b1, b2, (int) (baseX + lx), (int) (baseY + ly), (int) wz);
+	                }
+	                if (data == null)
+	                    data = denseBuf();
+	                data[lx | (ly << SHIFT) | (lz << 2 * SHIFT)] = block;
+	            }
+	        }
+	    }
+	    return data;
 	}
 
-	/** Old 2D heightmap terrain. */
 	private static byte[] generate2D(long cx, long cy, long cz) {
 		byte[] data = null;
 		long baseX = cx * SIZE, baseY = cy * SIZE, baseZ = cz * SIZE;
@@ -2447,6 +2564,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	private static final double CAVE_FULL_DENSITY_Y = 1000;
 	private static final double CAVE_SURFACE_WIDTH = 0.05;
 	private static final ThreadLocal<float[]> GEN_G = ThreadLocal.withInitial(() -> new float[CAVE_N * (CAVE_N + 2) * CAVE_N]);
+	private static final ThreadLocal<double[]> GEN_LIFT = ThreadLocal.withInitial(() -> new double[CAVE_N * CAVE_N]);
 	private static final ThreadLocal<float[]> GEN_COL = ThreadLocal.withInitial(() -> new float[CAVE_N + 2]);
 	private static final ThreadLocal<float[][]> CAVE_G = ThreadLocal.withInitial(() -> new float[2][CAVE_N * CAVE_N * CAVE_N]);
 	private static final double MOSS_Y0 = 192, MOSS_Y1 = 256, MOSS_Y2 = 512, MOSS_Y3 = 768, MOSS_K = 2;
@@ -3127,26 +3245,86 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		return null;
 	}
 
+	static final int PYR_CELL = 256, PYR_H = 100, PYR_SKIRT = 12, PYR_MENGER_GAP = 1000; // PYR_CELL: multiple of 64, >= 2*PYR_H
+	static final double PYR_CHANCE = 1.0 / 100000;
+
+	static final class PyramidSite {
+	    final long ax, az, baseY; final byte block;
+	    PyramidSite(long ax, long az, long baseY, byte block) { this.ax = ax; this.az = az; this.baseY = baseY; this.block = block; }
+	}
+	private static final PyramidSite NO_PYRAMID = new PyramidSite(0, 0, 0, AIR);
+	private static final ConcurrentHashMap<Long, PyramidSite> PYRAMIDS = new ConcurrentHashMap<>();
+
+	/** Pyramid owned by cell (gx, gz), or null. The common case is a single hash and a compare. */
+	static PyramidSite pyramidSite(long gx, long gz) {
+	    if (hash3((int) gx, 0, (int) gz, 0x9A7A) >= PYR_CHANCE) return null;
+	    long key = (gx << 32) ^ (gz & 0xFFFFFFFFL);
+	    PyramidSite s = PYRAMIDS.get(key);
+	    if (s == null) { s = computePyramid(gx, gz); PYRAMIDS.put(key, s); }
+	    return s == NO_PYRAMID ? null : s;
+	}
+
+	private static PyramidSite computePyramid(long gx, long gz) {
+	    int ix = (int) gx, iz = (int) gz;
+	    // The centre is jittered so the whole footprint stays inside this cell.
+	    long ax = gx * PYR_CELL + PYR_H + (long) (hash3(ix, 0, iz, 0x9A7B) * (PYR_CELL - 2 * PYR_H));
+	    long az = gz * PYR_CELL + PYR_H + (long) (hash3(ix, 0, iz, 0x9A7C) * (PYR_CELL - 2 * PYR_H));
+	    final double gap2 = (double) PYR_MENGER_GAP * PYR_MENGER_GAP;
+	    for (long mx = Math.floorDiv(ax - PYR_MENGER_GAP, (long) MENGER_CELL); mx <= Math.floorDiv(ax + PYR_MENGER_GAP, (long) MENGER_CELL); mx++)
+	        for (long mz = Math.floorDiv(az - PYR_MENGER_GAP, (long) MENGER_CELL); mz <= Math.floorDiv(az + PYR_MENGER_GAP, (long) MENGER_CELL); mz++) {
+	            MengerSite m = mengerSite(mx, mz);
+	            if (!m.valid) continue;
+	            double dx = m.ax - ax, dz = m.az - az;
+	            if (dx * dx + dz * dz < gap2) return NO_PYRAMID; // too close to a sponge
+	        }
+	    long base = Long.MIN_VALUE; // lowest ground (largest y, +y is down) under the footprint
+	    for (int i = -1; i <= 1; i++)
+	        for (int j = -1; j <= 1; j++)
+	            base = Math.max(base, mengerSurfaceY(ax + i * (PYR_H - 10), az + j * (PYR_H - 10)));
+	    byte block = new Random(World.key(gx, 0, gz) ^ 0x7079L).nextBoolean() ? CHECKERBOARD : TILE;
+	    return new PyramidSite(ax, az, base, block);
+	}
+
+	/** Writes this chunk's slice of the pyramid into the dense array (allocating it if the chunk was empty). */
+	private static byte[] stampPyramid(byte[] data, PyramidSite s, long cx, long cy, long cz) {
+	    final long bx = cx * SIZE, by = cy * SIZE, bz = cz * SIZE;
+	    final long yBot = s.baseY + PYR_SKIRT;
+	    if (by > yBot || by + SIZE - 1 < s.baseY - (PYR_H - 1)) return data;
+	    final long x0 = Math.max(bx, s.ax - (PYR_H - 1)), x1 = Math.min(bx + SIZE - 1, s.ax + (PYR_H - 1));
+	    final long z0 = Math.max(bz, s.az - (PYR_H - 1)), z1 = Math.min(bz + SIZE - 1, s.az + (PYR_H - 1));
+	    if (x0 > x1 || z0 > z1) return data;
+	    if (data == null) data = denseBuf();
+	    for (long z = z0; z <= z1; z++)
+	        for (long x = x0; x <= x1; x++) {
+	            long d = Math.max(Math.abs(x - s.ax), Math.abs(z - s.az));
+	            long ya = Math.max(by, s.baseY - (PYR_H - 1 - d)); // layer height shrinks by 1 per block from the centre
+	            long yb = Math.min(by + SIZE - 1, yBot);
+	            if (ya > yb) continue;
+	            int i = (int) (x - bx) | ((int) (ya - by) << SHIFT) | ((int) (z - bz) << (2 * SHIFT));
+	            for (long y = ya; y <= yb; y++, i += SIZE) data[i] = s.block;
+	        }
+	    return data;
+	}
 
 	// ---- Surface Menger sponges ----
 	// Candidates are world-grid aligned, so each intersecting chunk independently generates its own slice.
-	private static final int MENGER_CELL = 1024;
+	static final int MENGER_CELL = 1024;
 	private static final int MENGER_MAX_SIZE = 81;
 
 	private static long mengerSurfaceY(long wx, long wz) {
-		if (!terrain3D) return terrainHeight(wx, wz);
-		double half = 0.5 * TK * Math.abs(amp) * TDIV;
-		long lo = (long) Math.floor(TBASE - half) - 2;
-		long hi = (long) Math.ceil(TBASE + half) + 2;
-		// Density increases toward the deeper (+Y) side in the current coordinate system.
-		for (int i = 0; i < 64 && hi - lo > 1; i++) {
-			long mid = lo + (hi - lo) / 2;
-			if (density(wx, mid, wz) > 0) hi = mid; else lo = mid;
-		}
-		return hi - 1;
+	    if (!terrain3D) return terrainHeight(wx, wz);
+	    double half = 0.5 * TK * Math.abs(amp) * TDIV;
+	    double lift = mountainLift(wx, wz), plains = plainsAt(wx, wz);
+	    long lo = (long) Math.floor(TBASE - half - lift) - 2;
+	    long hi = (long) Math.ceil(TBASE + half) + 2;
+	    for (int i = 0; i < 64 && hi - lo > 1; i++) {
+	        long mid = lo + (hi - lo) / 2;
+	        if (density(wx, mid, wz, plains, lift) > 0) hi = mid; else lo = mid;
+	    }
+	    return hi - 1;
 	}
 
-	private static final class MengerSite {
+	static final class MengerSite {
 	    final long gx, gz, ax, az, surface; final int size; final byte block; final boolean valid;
 	    MengerSite(long gx, long gz) { this.gx = gx; this.gz = gz; ax = az = surface = 0; size = 0; block = AIR; valid = false; }
 	    MengerSite(long gx, long gz, long ax, long az, long surface, int size, byte block) {
@@ -3155,7 +3333,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	}
 	private static final ConcurrentHashMap<Long, MengerSite> MENGER_SITES = new ConcurrentHashMap<>();
 
-	private static MengerSite mengerSite(long gx, long gz) {
+	static MengerSite mengerSite(long gx, long gz) {
 	    long k = gx * 0x9E3779B97F4A7C15L ^ Long.rotateLeft(gz * 0xC2B2AE3D27D4EB4FL, 31);
 	    MengerSite s = MENGER_SITES.get(k);
 	    if (s != null && s.gx == gx && s.gz == gz) return s;
@@ -3224,7 +3402,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	private static final byte[] AUTUMN_LEAVES = { RED_LEAVES, ORANGE_LEAVES, YELLOW_LEAVES };
 
 	static boolean isAutumnForest(long wx, long wz) {
-		return isAutumnForest(wx, wz, noise(wx / 512.0, wz / 512.0));
+		return isAutumnForest(wx, wz, biomeAt(wx, wz));
 	}
 
 	/** biomeVal is the already computed noise(wx / 512, wz / 512). */
@@ -3361,6 +3539,9 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	}
 
 	private static void features(long cx, long cy, long cz) {
+		Octree d0 = world.chunk(cx, cy, cz);
+		if (d0 == null || d0 == World.UNLOADED) return;
+		if (cy * SIZE > surfaceBottom() || cy * SIZE + SIZE <= topBound()) return;
 	    long baseX = cx * SIZE, baseY = cy * SIZE, baseZ = cz * SIZE;
 	    long colKey = World.key(cx, 0, cz);
 	    for (int lx = 3; lx < SIZE - 3; lx += 6) {
@@ -3653,6 +3834,10 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 			generating = g;
 			homeKey = h;
 			if (pendingWrites.remove(key) != null) pendingCount = Math.max(0, pendingCount - ops.size());
+			if (ops != null) {
+			    Octree oc = world.chunk(cx, cy, cz);
+			    if (oc != null && oc != World.UNLOADED && !oc.shared) oc.compact();
+			}
 		}
 	}
 
@@ -4528,7 +4713,10 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 			Path dir = sharedWorldsPath();
 			Files.createDirectories(dir);
 			try (DirectoryStream<Path> ds = Files.newDirectoryStream(dir, "*.nexus")) {
-				for (Path p : ds) if (validNexusFile(p.toFile())) found.add(p.toFile());
+				for (Path p : ds) {
+				    File f = p.toFile();
+				    if (validNexusFile(f) || validNexusFile(backupOf(f).toFile())) found.add(f);
+				}
 			}
 		} catch (IOException ex) { frontMessage = "World folder unavailable: " + ex.getMessage(); }
 		found.sort(Comparator.comparing(f -> f.getName().toLowerCase(Locale.ROOT)));
@@ -4553,7 +4741,8 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	}
 
 	private static boolean validNexusFile(File file) {
-		if (file == null || !file.isFile() || !file.getName().toLowerCase(Locale.ROOT).endsWith(".nexus")) return false;
+		String n = file.getName().toLowerCase(Locale.ROOT);
+		if (file == null || !file.isFile() || !(n.endsWith(".nexus") || n.endsWith(".nexus.bak"))) return false;
 		try (DataInputStream in = new DataInputStream(new BufferedInputStream(Files.newInputStream(file.toPath())))) { return in.readInt() == MAGIC; }
 		catch (IOException ex) { return false; }
 	}
@@ -4762,62 +4951,21 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		        deleteConfirmWorld = null;
 
 		        if (target.exists() && deleteWorldFiles(target)) {
+		            try { Files.deleteIfExists(backupOf(target)); } catch (IOException ignored) {}
 		            invalidateWorldList();
 		            List<File> remaining = discoverSharedWorlds();
-		            worldSelection = remaining.isEmpty()
-		                ? -1
-		                : Math.min(worldSelection, remaining.size() - 1);
-		            worldScroll = Math.min(
-		                worldScroll,
-		                Math.max(0, remaining.size() - 1)
-		            );
+		            worldSelection = remaining.isEmpty() ? -1 : Math.min(worldSelection, remaining.size() - 1);
+		            worldScroll = Math.min(worldScroll, Math.max(0, remaining.size() - 1));
 		            frontMessage = "World deleted.";
 		        } else {
 		            frontMessage = "Could not delete world.";
 		        }
-		    } else if (mx < dx || mx >= dx + dialogW
-		            || my < dy || my >= dy + dialogH) {
+		    } else if (mx < dx || mx >= dx + dialogW || my < dy || my >= dy + dialogH) {
 		        deleteConfirmWorld = null;
 		    }
 
 		    repaint();
 		    return;
-		}
-
-		// Handle the delete confirmation dialog first.
-		if (deleteConfirmWorld != null) {
-			int dialogW = Math.min(440 * gui, width - 32);
-			int dialogH = 142 * gui;
-			int dx = (width - dialogW) / 2;
-			int dy = (height - dialogH) / 2;
-			int dbw = (dialogW - 30 * gui) / 2;
-			int dby = dy + 82 * gui;
-
-			if (new Rectangle(dx + 10 * gui, dby, dbw, 38 * gui).contains(mx, my)) {
-				// Cancel deletion.
-				deleteConfirmWorld = null;
-				frontMessage = "";
-			} else if (new Rectangle(dx + 20 * gui + dbw, dby, dialogW - 30 * gui - dbw, 38 * gui).contains(mx, my)) {
-				// Confirm deletion.
-				File target = deleteConfirmWorld;
-				deleteConfirmWorld = null;
-
-				if (deleteWorldFiles(target)) {
-					invalidateWorldList();
-					List<File> remaining = discoverSharedWorlds();
-					worldSelection = Math.max(0, Math.min(worldSelection, remaining.size() - 1));
-					worldScroll = Math.max(0, Math.min(worldScroll, Math.max(0, remaining.size() - 1)));
-					frontMessage = "World deleted.";
-				} else {
-					frontMessage = "Could not delete world.";
-				}
-			} else if (!new Rectangle(dx, dy, dialogW, dialogH).contains(mx, my)) {
-				// Clicking outside dismisses the dialog without deleting.
-				deleteConfirmWorld = null;
-			}
-
-			repaint();
-			return;
 		}
 
 		int bw = Math.min(310 * gui, Math.min(560 * gui, width - 32) - 36);
@@ -4945,11 +5093,9 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		survival = false; dead = false; deathConfirm = false; leftDown = false; health = MAX_HEALTH; resetBreak();
 		paused = false; settingsMenu = false; quitConfirm = false; dialogOpen = false;
 		mainMenu = true; frontScreen = 0; frontMessage = "";
-		x.setValue(15493); y.setValue(96); z.setValue(17236);
-		prevX.set(x); prevY.set(y); prevZ.set(z);
-		yaw = 1.2; pitch = -2.0 / 3.0; setDist(368);
-		velX = velY = velZ = 0; needGround = false;
-		fly = true; mouseLookArmed = false;
+		mainMenuPosition(true, true);
+		needGround = false;
+		mouseLookArmed = false;
 		lock = false; focus = true;
 		if (frame != null) frame.setCursor(Cursor.getDefaultCursor());
 		center(); reloadChunks(false); lastMenuFrameNs = 0;
@@ -5554,23 +5700,46 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 			finally { saveInProgress.set(false); }
 		});
 	}
-	/** Best-effort final save for window close, System.exit, and other normal JVM shutdowns. */
+
 	private static void saveOnShutdown() {
-		if (shutdownSaveStarted) return;
-		shutdownSaveStarted = true;
-		File file = activeSaveFile;
-		if (!persistentStorage || file == null) return; // no chosen world file to save to
-		try {
-			// Let an autosave already in progress finish before writing the final snapshot.
-			long deadline = System.currentTimeMillis() + 15_000L;
-			while (saveInProgress.get() && System.currentTimeMillis() < deadline)
-				Thread.sleep(25L);
-			SaveSnapshot snapshot = new SaveSnapshot(file, changedChunkSnapshot());
-			writeSave(snapshot); // synchronous: shutdown hooks must finish before the JVM exits
-		} catch (Throwable t) {
-			System.err.println("Final world save failed: " + t);
-			t.printStackTrace();
-		}
+	    if (shutdownSaveStarted) return;
+	    shutdownSaveStarted = true;
+	    try {
+	        File file = activeSaveFile;
+	        if (persistentStorage && file != null) {
+	            long deadline = System.currentTimeMillis() + 15_000L;
+	            while (saveInProgress.get() && System.currentTimeMillis() < deadline)
+	                Thread.sleep(25L);
+	            writeSave(new SaveSnapshot(file, changedChunkSnapshot()));
+	        }
+	    } catch (Throwable t) {
+	        System.err.println("Final world save failed: " + t);
+	        t.printStackTrace();
+	    } finally {
+	        deleteStaleTmp();
+	    }
+	}
+
+	private static Path backupOf(File f) {
+	    return f.toPath().resolveSibling(f.getName() + ".bak");
+	}
+
+	/** Removes leftover half-written saves. Call only while no save is running. */
+	static void deleteStaleTmp() {
+	    try (DirectoryStream<Path> ds = Files.newDirectoryStream(sharedWorldsPath(), "*.nexus.tmp")) {
+	        for (Path p : ds) try { Files.deleteIfExists(p); } catch (IOException ignored) {}
+	    } catch (IOException ignored) {}
+	}
+
+	/** Deletes any .bak whose main world file no longer exists. Call only while no save is running. */
+	static void deleteOrphanBackups() {
+	    try (DirectoryStream<Path> ds = Files.newDirectoryStream(sharedWorldsPath(), "*.nexus.bak")) {
+	        for (Path bak : ds) {
+	            String n = bak.getFileName().toString();
+	            Path main = bak.resolveSibling(n.substring(0, n.length() - 4)); // strip ".bak"
+	            if (!Files.exists(main)) try { Files.deleteIfExists(bak); } catch (IOException ignored) {}
+	        }
+	    } catch (IOException ignored) {}
 	}
 
 	private static void writeSave(SaveSnapshot s) {
@@ -5619,8 +5788,9 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 			catch (AtomicMoveNotSupportedException ex) { Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING); }
 		} catch (Exception e) {
 			e.printStackTrace();
-			try { Files.deleteIfExists(tmp); } catch (IOException ignored) {}
 			SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(frame, "Failed to save world:\n" + e.getMessage()));
+		} finally {
+		    try { Files.deleteIfExists(tmp); } catch (IOException ignored) {}
 		}
 	}
 
@@ -5667,18 +5837,38 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	}
 
 	private static void doLoad(File file) {
-		fly = false; // Turn off title-screen flight before loading any world data.
-		worldLoading = true;
-		worldLoadReadyAt = 0L;
-		velX = velY = velZ = 0;
-		mouseLookArmed = false;
+	    fly = false; // Turn off title-screen flight before loading any world data.
+	    worldLoading = true;
+	    worldLoadReadyAt = 0L;
+	    velX = velY = velZ = 0;
+	    mouseLookArmed = false;
+	    Exception first = null;
+	    try { loadWorld(file, file); return; }
+	    catch (Exception e) { first = e; System.err.println("World load failed, trying backup: " + e); }
+
+	    Path bak = backupOf(file);
+	    if (Files.isRegularFile(bak)) {
+	        try {
+	            loadWorld(bak.toFile(), file);
+	            // Put the good copy back so the next save doesn't overwrite the backup with corrupt data.
+	            try { Files.copy(bak, file.toPath(), StandardCopyOption.REPLACE_EXISTING); } catch (IOException ignored) {}
+	            say("World was corrupt - restored from backup");
+	            return;
+	        } catch (Exception second) {
+	            second.printStackTrace();
+	        }
+	    }
+	    worldLoading = false; worldLoadReadyAt = 0L;
+	    first.printStackTrace();
+	    JOptionPane.showMessageDialog(frame, "Failed to load world:\n" + first.getMessage());
+	}
+
+	private static void loadWorld(File source, File save) throws Exception {
 		final int MAX_BLOB = 2 * VOL + 16; // worst case: alternating blocks, 2 bytes each
-		try (DataInputStream in = new DataInputStream(new BufferedInputStream(Files.newInputStream(file.toPath()), 1 << 16))) {
+		try (DataInputStream in = new DataInputStream(new BufferedInputStream(Files.newInputStream(source.toPath()), 1 << 16))) {
 			int magic = in.readInt();
 			if (magic != MAGIC) {
-				worldLoading = false; worldLoadReadyAt = 0L;
-				JOptionPane.showMessageDialog(frame, "Unsupported file (older format, or not a Nexus save)");
-				return;
+				throw new IOException("Not a Nexus save");
 			}
 			SplitDecimal nx, ny, nz;
 			nx = new SplitDecimal(in.readLong(), in.readDouble());
@@ -5745,7 +5935,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 			savedChunks.putAll(loaded);
 			for (long k : loaded.keySet())
 				userTopY = Math.min(userTopY, World.unpackY(k) * SIZE);
-			activeSaveFile = file;
+			activeSaveFile = save;
 			persistentStorage = true;
 			repairSavedSpawnIfBlocked();
 			mainMenu = false;
@@ -5755,11 +5945,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 			lastPersistentSave = System.currentTimeMillis();
 			needGround = false;
 			prevX.set(x); prevY.set(y); prevZ.set(z);
-			if (dead) die();   // saved while dead -> shows the death screen again
-		} catch (Exception e) {
-			worldLoading = false; worldLoadReadyAt = 0L;
-			e.printStackTrace();
-			JOptionPane.showMessageDialog(frame, "Failed to load world:\n" + e.getMessage());
+			if (dead) die(); // saved while dead -> shows the death screen again
 		}
 	}
 
@@ -5874,20 +6060,10 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 
 	// ------------------- feature locator (N = cycle target, B = teleport)
 	static final String[] LOC_NAMES = {
-		    "Moss Basin",
-		    "Snow Basin",
-		    "Moss Cave",
-		    "Snow Cave",
-		    "Obsidian Cave",
-		    "Crystal Cave",
-		    "Basalt Cave",
-		    "Snowy Biome",
-		    "Icy Biome",
-		    "Desert Biome",
-		    "Plains Biome",
-		    "Autumn Forest",
-		    "Menger Sponge"
-		};
+			"Moss Basin", "Snow Basin", "Moss Cave", "Snow Cave", "Obsidian Cave", "Crystal Cave", "Basalt Cave",
+		    "Snowy Biome", "Icy Biome", "Desert Biome", "Plains Biome", "Autumn Forest", "Menger Sponge",
+		    "Mountain Range", "Giant Pyramid"
+	};
 	static int locTarget;
 	static volatile String locMsg = "";
 	static volatile long locMsgTime;
@@ -5933,7 +6109,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 			y0 = (long) (TBASE + layer2(wx, wz)) + 12;
 			y1 = y0 + 300;
 		} else {
-			if (biome == CB_SNOW && noise(wx / 512.0, wz / 512.0) <= 1.4)
+			if (biome == CB_SNOW && biomeAt(wx, wz) <= 1.4)
 				return null; // snow caves only under snowy biomes
 			y0 = (long) MOSS_Y0 + 8;
 			y1 = (long) MOSS_Y3 - 8;
@@ -5945,7 +6121,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	}
 
 	private static double[] surfaceProbe(int t, long wx, long wz) {
-	    double n = noise(wx / 512.0, wz / 512.0);
+		double n = biomeAt(wx, wz);
 
 	    boolean ok = t == 7 ? n > 1.4 && n < 1.85
 	             : t == 8 ? n > 1.85
@@ -5958,6 +6134,16 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 
 	/** One grid cell (gx, gz) for the given target; returns a world {x, y, z} or null. */
 	private static double[] probe(int t, long gx, long gz, int cell) {
+		if (t == 13) {
+		    long wx = gx * cell + cell / 2, wz = gz * cell + cell / 2;
+		    if (mountainRaw(wx, wz) < MTN_LO) return null; // cheap reject before the full lift calculation
+		    double l = mountainLift(wx, wz);
+		    return l > MTN_H * 0.35 ? new double[] { wx + 0.5, TBASE - l, wz + 0.5 } : null;
+		}
+		if (t == 14) {
+		    PyramidSite s = pyramidSite(gx, gz);
+		    return s == null ? null : new double[] { s.ax + 0.5, s.baseY - PYR_H - 4, s.az + 0.5 };
+		}
 		if (t == 12) {
 		    MengerSite s = mengerSite(gx, gz);
 		    return s.valid ? new double[] { s.ax + 0.5, s.surface - s.size / 2.0 + 0.5, s.az + 0.5 } : null;
@@ -5992,11 +6178,12 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 
 	/** Square rings of cells around the player, stopping once no farther ring can hold a closer hit. */
 	private static double[] search(int t, long px, long pz) {
-	    final int cell = t < 2 ? BASIN_CELL : t < 7 ? 32 : t == 12 ? MENGER_CELL : 64;
-	    final int rings = (int) Math.ceil(LOCATE_RADIUS / cell);
-	    final long cx = Math.floorDiv(px, (long) cell), cz = Math.floorDiv(pz, (long) cell);
-	    double[] best = null;
-	    double bestD2 = LOCATE_RADIUS * LOCATE_RADIUS;
+		final int cell = t < 2 ? BASIN_CELL : t < 7 ? 32 : t == 12 ? MENGER_CELL : t == 13 ? 512 : t == 14 ? PYR_CELL : 64;
+		final double limit = (t == 13 || t == 14) ? 100000 : LOCATE_RADIUS;
+		final int rings = (int) Math.ceil(limit / cell);
+		final long cx = Math.floorDiv(px, (long) cell), cz = Math.floorDiv(pz, (long) cell);
+		double[] best = null;
+		double bestD2 = limit * limit;
 	    for (int r = 0; r <= rings; r++) {
 	        double ringMin = Math.max(0, r - 1) * (double) cell;
 	        if (best != null && ringMin * ringMin > bestD2) break;
@@ -6018,11 +6205,10 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	/** Main thread only. Drops every loaded chunk and any in-flight generation so nothing stale survives. */
 	static void reloadChunks(boolean keepEdits) {
 		MENGER_SITES.clear();
+		PYRAMIDS.clear();
 		lightVer++;
-		if (inFlight != null) {
-			for (Future<Octree> f : inFlight.futures) f.cancel(true);
-			inFlight = null;
-		}
+		for (GenJob j : jobs) j.future.cancel(true);
+		jobs.clear(); jobKeys.clear();
 		if (keepEdits) flushDirty(); else clearSaved();
 		pendingWrites.clear(); pendingCount = 0;
 		chunkCache.clear(); cacheBytes = 0;
@@ -6550,7 +6736,6 @@ final class Render implements Callable<Void> {
 	static final int SHADOW_RANGE = 128;
 	static boolean[] opaque = new boolean[256];
 	private int seenWorld = -1, seenStream = -1;
-    private int shadowCacheWorld = -1;
 	Semaphore go;
 	static final byte TILE = 16;
 	static int tilesX, tilesTotal, fogStamp;
@@ -6592,6 +6777,7 @@ final class Render implements Callable<Void> {
 	// integrated along x, so a run of voxels is one subtraction without a hard-edged light cutoff.
 	static final int[] ISQ = new int[LIGHT_R * LIGHT_R + 1];
 	static final double[] PRE;
+	static volatile boolean shadowProvisional; // some shadow ray crossed an unloaded chunk this frame
 	static {
 		for (byte i = 0; i < BLOCK_COUNT; i++) GLOW_TINT[i] = new double[] { 1, 1, 1 };
 		GLOW_TINT[MAGMA]     = new double[] { 1.0, 0.50, 0.12 };
@@ -6639,6 +6825,12 @@ final class Render implements Callable<Void> {
 	        }
 	    }
 	    tileOrderX = tilesX; tileOrderY = tilesY;
+	}
+
+	/** True if the voxel the ray just stepped out of is glass (cheap: reuses the leaf cache). */
+	private boolean glassBehind(long bx, long by, long bz, int axis, int sx, int sy, int sz) {
+	    int p = probe(bx - (axis == 0 ? sx : 0), by - (axis == 1 ? sy : 0), bz - (axis == 2 ? sz : 0));
+	    return p >= 0 && (p & 0xFF) == GLASS;
 	}
 
 	static void prepare() {
@@ -6701,6 +6893,11 @@ final class Render implements Callable<Void> {
 		sunR = sunColor.x; sunG = sunColor.y; sunB = sunColor.z;
 		ambR = ambColor.x; ambG = ambColor.y; ambB = ambColor.z;
 		skyR = skyColor.x; skyG = skyColor.y; skyB = skyColor.z;
+		int wv = Nexus.worldVer, sv = Nexus.streamVer;
+	    if (wv != cacheWorld || sv != cacheStream) {
+	        cacheWorld = wv; cacheStream = sv;
+	        SKY.invalidate(); AO.invalidate(); SHADOW.invalidate();
+	    }
 		prepareFog();
 		tilesX = (w + TILE - 1) / TILE;
 		tilesTotal = tilesX * ((h + TILE - 1) / TILE);
@@ -6726,30 +6923,26 @@ final class Render implements Callable<Void> {
 
 	@Override
 	public Void call() {
-		if (seenLight != Nexus.lightVer || seenWorld != Nexus.worldVer|| seenStream != Nexus.streamVer) {
+	    if (seenLight != Nexus.lightVer || seenWorld != Nexus.worldVer || seenStream != Nexus.streamVer) {
 	        Arrays.fill(lKey, 0L);
 	        seenLight = Nexus.lightVer;
 	        seenWorld = Nexus.worldVer;
 	        seenStream = Nexus.streamVer;
 	    }
-	    if (shadowCacheWorld != Nexus.worldVer) {
-	        shMemo.requestClear();
-	        shadowCacheWorld = Nexus.worldVer;
+	    ccx = ccy = ccz = Long.MIN_VALUE;
+	    cchunk = null;
+	    csz = 0;
+	    int tile;
+	    while ((tile = next.getAndIncrement()) < tilesTotal) {
+	        tile = tileOrder[tile];
+	        fast = Nexus.lightWarming() && System.nanoTime() < warmDeadline;
+	        if (fast) warmIncomplete = true;
+	        int c0 = (tile % tilesX) * TILE, r0 = (tile / tilesX) * TILE;
+	        int c1 = Math.min(w, c0 + TILE), r1 = Math.min(h, r0 + TILE);
+	        for (int row = r0; row < r1; row++)
+	            renderRow(row, c0, c1);
 	    }
-		ccx = ccy = ccz = Long.MIN_VALUE;
-		cchunk = null;
-		csz = 0;
-		int tile;
-		while ((tile = next.getAndIncrement()) < tilesTotal) {
-			tile = tileOrder[tile];
-			fast = Nexus.lightWarming() && System.nanoTime() < warmDeadline;
-			if (fast) warmIncomplete = true;
-			int c0 = (tile % tilesX) * TILE, r0 = (tile / tilesX) * TILE;
-			int c1 = Math.min(w, c0 + TILE), r1 = Math.min(h, r0 + TILE);
-            for (int row = r0; row < r1; row++)
-                renderRow(row, c0, c1);
-		}
-		return null;
+	    return null;
 	}
 
 	/** v + s, but stays at v instead of wrapping when it would overflow. */
@@ -6788,7 +6981,7 @@ final class Render implements Callable<Void> {
 	private boolean glowNearby(long x, long y, long z) {
 	    long bx = Math.floorDiv(x, 8), by = Math.floorDiv(y, 8), bz = Math.floorDiv(z, 8);
 	    int version = 31 * worldVer + streamVer;
-	    long key = Memo.hash(bx, by, bz, 7L ^ ((long) version << 8));
+	    long key = Cache.hash(bx, by, bz, 7L ^ ((long) version << 8));
 	    int slot = (int) (key >>> 20) & (GLOW_NEAR_CACHE_SIZE - 1);
 	    long e = glowNearTable[slot];
 	    if (((e ^ key) & ~0xFFL) == 0 && (e & 0xFF) != 0)
@@ -6814,7 +7007,7 @@ final class Render implements Callable<Void> {
 		lightProvisional = false;
 		final int s = t < LIGHT_NEAR ? 0 : t < LIGHT_FAR ? 1 : 2;
 	    final long qx = fx >> s, qy = fy >> s, qz = fz >> s;
-	    final long h = Memo.hash(qx, qy, qz, s);
+	    final long h = Cache.hash(qx, qy, qz, s);
 	    final int slot = (int) (h >>> 20) & (LCACHE - 1);
 	    if (lKey[slot] == h) {
 	        int v = lVal[slot];
@@ -6853,7 +7046,8 @@ final class Render implements Callable<Void> {
 				      	dx = (int) ((x | MASK) + 1 - ox);
 				      	continue;
 				    }
-					final int id = info & 0xFF, lg = info >> 8;
+					final byte id = (byte) (info & 0xFF);
+					final int lg = info >> 8;
 					int end = dx; // last dx covered by this leaf cube
 					if (lg > 0) {
 						long cubeEnd = ((x & ~((1L << lg) - 1)) + (1L << lg) - 1) - ox;
@@ -6988,7 +7182,7 @@ final class Render implements Callable<Void> {
 		double tmz = sz == 0 ? INF : (sz > 0 ? (double) (rz + 1) - oz : oz - rz) * tdz;
 
 		for (int steps = (int) (3 * maxT) + 16; steps-- > 0;) {
-			int axis;
+			byte axis;
 			double t;
 			if (tmx < tmy) {
 				if (tmx < tmz) { axis = 0; t = tmx; } else { axis = 2; t = tmz; }
@@ -7009,9 +7203,9 @@ final class Render implements Callable<Void> {
 					shadowUnloaded = true;
 					return blockUnloaded; // unloaded: shadow rays under cover treat it as solid
 				}
-				int lg = info >> 8;
-				if ((info & 0xFF) != AIR || lg == 0)
-					break;
+				int lg = info >> 8, cid = info & 0xFF;
+				if ((cid != AIR && cid != GLASS) || lg == 0)
+				    break;
 				long S = 1L << lg, M = ~(S - 1);
 				long x0c = bx & M, y0c = by & M, z0c = bz & M;
 				long nx = sx > 0 ? x0c + S - bx : sx < 0 ? bx - x0c + 1 : 0;
@@ -7020,7 +7214,7 @@ final class Render implements Callable<Void> {
 				double ex = sx == 0 ? INF : tmx + (nx - 1) * tdx;
 				double ey = sy == 0 ? INF : tmy + (ny - 1) * tdy;
 				double ez = sz == 0 ? INF : tmz + (nz - 1) * tdz;
-				int ea;
+				byte ea;
 				double te;
 				if (ex <= ey && ex <= ez) { ea = 0; te = ex; }
 				else if (ey <= ez) { ea = 1; te = ey; }
@@ -7036,16 +7230,11 @@ final class Render implements Callable<Void> {
 				axis = ea;
 				t = te;
 			}
-			int id = info & 0xFF;
-			if (id == AIR)
-				continue;
+			byte id = (byte) (info & 0xFF);
+			if (id == AIR || id == GLASS)
+			    continue;
 			if (opaque[id])
-				return true; // every texel solid: no hit position or texture lookup needed
-			if (id == GLASS) {
-				long ax = bx - (axis == 0 ? sx : 0), ay = by - (axis == 1 ? sy : 0), az = bz - (axis == 2 ? sz : 0);
-				if (getBlock(ax, ay, az) == GLASS)
-					continue;
-			}
+			    return true;
 			// leaves / glass: same texel test as march()
 			double hx = ox + dx * t, hy = oy + dy * t, hz = oz + dz * t;
 			int texX, texY;
@@ -7075,40 +7264,41 @@ final class Render implements Callable<Void> {
 		return ((c - pb * G) + 0.5) / G;
 	}
 
-	private boolean inShadow(double hx, double hy, double hz, int axis, int sign, long fx, long fy, long fz, double t, boolean deep) {
-		int G = SHADOW_GRID;
-		double ox = hx, oy = hy, oz = hz;
-		long key = 0;
-		if (G > 0) {
-			double fp = t * Math.max(xScale, yScale);
-			while (G > 4 && G * fp * SHADOW_LOD > 1.0)
-				G >>= 1;
-			long cu, cv, nw;
-			switch (axis) {
-			case 0:
-				cu = cellIdx(pby, hy, G); cv = cellIdx(pbz, hz, G); nw = fx;
-				oy = cellCentre(cu, pby, G); oz = cellCentre(cv, pbz, G);
-				break;
-			case 1:
-				cu = cellIdx(pbx, hx, G); cv = cellIdx(pbz, hz, G); nw = fy;
-				ox = cellCentre(cu, pbx, G); oz = cellCentre(cv, pbz, G);
-				break;
-			default:
-				cu = cellIdx(pbx, hx, G); cv = cellIdx(pby, hy, G); nw = fz;
-				ox = cellCentre(cu, pbx, G); oy = cellCentre(cv, pby, G);
-			}
-			long epoch = ((long) Nexus.worldVer << 32) ^ (Nexus.streamVer & 0xFFFFFFFFL);
-			key = Memo.hash(cu, cv, nw, (((long) sunVer) << 32) ^ epoch ^ (deep ? 512L : 0L) ^ ((long) G << 4) ^ (axis << 1) ^ (sign > 0 ? 1L : 0L));
-			int c = shMemo.get(key);
-			if (c >= 0)
-				return c != 0;
-		}
-		double nx = axis == 0 ? sign : 0, ny = axis == 1 ? sign : 0, nz = axis == 2 ? sign : 0;
-		shadowUnloaded = false;
-		boolean s = occluded(ox + nx * EPS, oy + ny * EPS, oz + nz * EPS, slx, sly, slz, deep ? DEEP_SHADOW : shadowDist, deep);
-		if (G > 0 && !shadowUnloaded)
-			shMemo.put(key, s ? 1 : 0);
-		return s;
+	private boolean inShadow(double hx, double hy, double hz, byte axis, byte sign, long fx, long fy, long fz, double t, boolean deep) {
+	    int G = SHADOW_GRID;
+	    double ox = hx, oy = hy, oz = hz;
+	    long key = 0;
+	    if (G > 0) {
+	        double fp = t * Math.max(xScale, yScale);
+	        while (G > 4 && G * fp * SHADOW_LOD > 1.0)
+	            G >>= 1;
+	        long cu, cv, nw;
+	        switch (axis) {
+	        case 0:
+	            cu = cellIdx(pby, hy, G); cv = cellIdx(pbz, hz, G); nw = fx;
+	            oy = cellCentre(cu, pby, G); oz = cellCentre(cv, pbz, G);
+	            break;
+	        case 1:
+	            cu = cellIdx(pbx, hx, G); cv = cellIdx(pbz, hz, G); nw = fy;
+	            ox = cellCentre(cu, pbx, G); oz = cellCentre(cv, pbz, G);
+	            break;
+	        default:
+	            cu = cellIdx(pbx, hx, G); cv = cellIdx(pby, hy, G); nw = fz;
+	            ox = cellCentre(cu, pbx, G); oy = cellCentre(cv, pby, G);
+	        }
+	        // world/stream/sun versions are handled by SHADOW.invalidate() in prepare()
+	        key = Cache.hash(cu, cv, nw, ((long) G << 4) ^ (axis << 1) ^ (sign > 0 ? 1L : 0L) ^ (deep ? 512L : 0L));
+	        int c = SHADOW.get(key);
+	        if (c >= 0)
+	            return c != 0;
+	    }
+	    double nx = axis == 0 ? sign : 0, ny = axis == 1 ? sign : 0, nz = axis == 2 ? sign : 0;
+	    shadowUnloaded = false;
+	    boolean s = occluded(ox + nx * EPS, oy + ny * EPS, oz + nz * EPS, slx, sly, slz, deep ? DEEP_SHADOW : shadowDist, deep);
+	    if (G > 0)
+	        SHADOW.commit(key, s ? 1 : 0, !shadowUnloaded);
+	    if (shadowUnloaded) shadowProvisional = true;
+	    return s;
 	}
 
 	private boolean march(double ox, double oy, double oz, double dx, double dy, double dz, double maxT, boolean primary, boolean center) {
@@ -7152,9 +7342,12 @@ final class Render implements Callable<Void> {
 			for (;;) {
 				info = probe(bx, by, bz);
 				if (info < 0) { hUnloaded = true; return false; }
-				int lg = info >> 8;
-				if ((info & 0xFF) != AIR || lg == 0)
-					break;
+				int lg = info >> 8, cid = info & 0xFF;
+				// Air is skipped. Glass is skipped too when it is invisible to this ray (sky rays),
+				// or when the ray is already inside glass (interior faces are never drawn).
+				boolean skip = cid == AIR || (cid == GLASS && (!primary || glassBehind(bx, by, bz, axis, sx, sy, sz)));
+				if (!skip || lg == 0)
+				    break;
 				// Air cube of side 2^lg: jump to where the ray leaves it.
 				long S = 1L << lg, M = ~(S - 1);
 				long x0c = bx & M, y0c = by & M, z0c = bz & M;
@@ -7181,16 +7374,8 @@ final class Render implements Callable<Void> {
 				t = te;
 			}
 			byte id = (byte) (info & 0xFF);
-			if (id == AIR)
-				continue;
-
-			if (id == GLASS) {
-				long ax = bx - (axis == 0 ? sx : 0);
-				long ay = by - (axis == 1 ? sy : 0);
-				long az = bz - (axis == 2 ? sz : 0);
-				if (getBlock(ax, ay, az) == GLASS)
-					continue;
-			}
+			if (id == AIR || (id == GLASS && (!primary || glassBehind(bx, by, bz, axis, sx, sy, sz))))
+			    continue;
 
 			double hx = ox + dx * t, hy = oy + dy * t, hz = oz + dz * t;
 			int texX, texY;
@@ -7268,30 +7453,31 @@ final class Render implements Callable<Void> {
 		fogCamR = camFog.r; fogCamG = camFog.g; fogCamB = camFog.b;
 	}
 
-	/**
-	 * Detect highly perforated BRICKS/OAK_PLANKS structures such as the procedural Menger
-	 * sponge. Their repeated tiny cavities make per-face AO and shadowing look noisy,
-	 * so these local cells use a consistent, flat light level instead. Results are
-	 * memoized per block and world/stream epoch; unloaded neighbours never count as air.
-	 */
-	private boolean flatPorousLighting(long x, long y, long z, int id) {
-		if (id != BRICKS && id != OAK_PLANKS) return false;
-		long epoch = ((long) Nexus.worldVer << 32) ^ (Nexus.streamVer & 0xFFFFFFFFL);
-		long key = Memo.hash(x, y, z, epoch ^ 0x4D454E474552L);
-		int cached = porousMemo.get(key);
-		if (cached >= 0) return cached != 0;
-		int air = 0, solidCount = 0;
-		for (int dy = -1; dy <= 1; dy++) for (int dz = -1; dz <= 1; dz++) for (int dx = -1; dx <= 1; dx++) {
-			if (dx == 0 && dy == 0 && dz == 0) continue;
-			int q = probe(x + dx, y + dy, z + dz);
-			if (q < 0) return false; // don't classify a structure against incomplete terrain
-			int neighbour = q & 0xFF;
-			if (neighbour == AIR) air++;
-			else if (neighbour < OPAQUE.length && OPAQUE[neighbour]) solidCount++;
-		}
-		boolean porous = air >= 12 && solidCount >= 5;
-		porousMemo.put(key, porous ? 1 : 0);
-		return porous;
+	// Snapshot of the sponge sites around the renderer's current 1024x1024 column cell.
+	// Built locally and assigned in one go, so a half-built list is never visible.
+	private long pgx = Long.MIN_VALUE, pgz;
+	private int pgVer = -1;
+	private Nexus.MengerSite[] pSites = new Nexus.MengerSite[0];
+
+	private boolean flatPorousLighting(long x, long y, long z, byte id) {
+	    final long gx = Math.floorDiv(x, (long) Nexus.MENGER_CELL), gz = Math.floorDiv(z, (long) Nexus.MENGER_CELL);
+	    if (gx != pgx || gz != pgz || pgVer != Nexus.worldVer) {
+	        Nexus.MengerSite[] tmp = new Nexus.MengerSite[9];
+	        int n = 0;
+	        for (long a = gx - 1; a <= gx + 1; a++)
+	            for (long b = gz - 1; b <= gz + 1; b++) {
+	                Nexus.MengerSite s = Nexus.mengerSite(a, b);
+	                if (s.valid) tmp[n++] = s;
+	            }
+	        pSites = Arrays.copyOf(tmp, n);
+	        pgx = gx; pgz = gz; pgVer = Nexus.worldVer;
+	    }
+	    for (Nexus.MengerSite s : pSites) {
+	        final long x0 = s.ax - s.size / 2, z0 = s.az - s.size / 2, topY = s.surface - s.size + 1;
+	        if (x >= x0 && x < x0 + s.size && z >= z0 && z < z0 + s.size && y >= topY && y <= s.surface)
+	            return true;
+	    }
+	    return false;
 	}
 
 	private void shadeClassic() {
@@ -7356,11 +7542,16 @@ final class Render implements Callable<Void> {
 
 		final long fx = hBx + (axis == 0 ? sign : 0), fy = hBy + (axis == 1 ? sign : 0), fz = hBz + (axis == 2 ? sign : 0);
 		if (flatPorousLighting(hBx, hBy, hBz, id)) {
-			// Skip secondary sky/shadow/AO rays for the sponge and use one level on every face.
-			hR = cr * (ambR * 0.85 + gl) * (1 - ft) + fog.r * ft;
-			hG = cg * (ambG * 0.85 + gl) * (1 - ft) + fog.g * ft;
-			hB = cb * (ambB * 0.85 + gl) * (1 - ft) + fog.b * ft;
-			return;
+		    // Flat, bright light: ambient plus a fixed share of the sun, faded out at night / underground.
+		    final double day = smoothstep(-0.1, 0.4, -ly) * (1.0 - cave);
+		    final double dim = 1.0 - 0.6 * cave;
+		    final double lr = ambR * dim + sunR * 0.55 * day;
+		    final double lg = ambG * dim + sunG * 0.55 * day;
+		    final double lb = ambB * dim + sunB * 0.55 * day;
+		    hR = cr * (lr + gl) * (1 - ft) + fog.r * ft;
+		    hG = cg * (lg + gl) * (1 - ft) + fog.g * ft;
+		    hB = cb * (lb + gl) * (1 - ft) + fog.b * ft;
+		    return;
 		}
 
         double sky = 1, open = 1;
@@ -7411,10 +7602,10 @@ final class Render implements Callable<Void> {
 	}
 
 	private boolean solid(long x, long y, long z) {
-		int p = probe(x, y, z);
-		if (p < 0) return false;
-		int id = p & 0xFF;
-		return id < OPAQUE.length && OPAQUE[id];
+	    int p = probe(x, y, z);
+	    if (p < 0) { solidUnloaded = true; return false; }
+	    int id = p & 0xFF;
+	    return id < OPAQUE.length && OPAQUE[id];
 	}
 
 	private double faceAO(double hx, double hy, double hz, byte axis, long fx, long fy, long fz, double strength) {
@@ -7437,38 +7628,36 @@ final class Render implements Callable<Void> {
 	    final double dy = y - py;
 	    final double dz = z - pz;
 
-	    return dx * dx + dy * dy + dz * dz <= 16384.0;
+	    return dx * dx + dy * dy + dz * dz <= 65536.0;
 	}
 
 	private double aoAt(long x, long y, long z, byte a, double fu, double fv) {
-	    final int um, up, vm, vp;
-
-	    switch (a) {
-	        case 0:
-	            um = solid(x, y - 1, z) ? 1 : 0;
-	            up = solid(x, y + 1, z) ? 1 : 0;
-	            vm = solid(x, y, z - 1) ? 1 : 0;
-	            vp = solid(x, y, z + 1) ? 1 : 0;
-	            break;
-	        case 1:
-	            um = solid(x - 1, y, z) ? 1 : 0;
-	            up = solid(x + 1, y, z) ? 1 : 0;
-	            vm = solid(x, y, z - 1) ? 1 : 0;
-	            vp = solid(x, y, z + 1) ? 1 : 0;
-	            break;
-	        default:
-	            um = solid(x - 1, y, z) ? 1 : 0;
-	            up = solid(x + 1, y, z) ? 1 : 0;
-	            vm = solid(x, y - 1, z) ? 1 : 0;
-	            vp = solid(x, y + 1, z) ? 1 : 0;
-	            break;
+	    final long key = Cache.hash(x, y, z, 0xA0L | a);
+	    int p = AO.get(key);
+	    if (p < 0) {
+	        solidUnloaded = false;
+	        final int um, up, vm, vp;
+	        switch (a) {
+	            case 0:
+	                um = solid(x, y - 1, z) ? 1 : 0; up = solid(x, y + 1, z) ? 1 : 0;
+	                vm = solid(x, y, z - 1) ? 1 : 0; vp = solid(x, y, z + 1) ? 1 : 0;
+	                break;
+	            case 1:
+	                um = solid(x - 1, y, z) ? 1 : 0; up = solid(x + 1, y, z) ? 1 : 0;
+	                vm = solid(x, y, z - 1) ? 1 : 0; vp = solid(x, y, z + 1) ? 1 : 0;
+	                break;
+	            default:
+	                um = solid(x - 1, y, z) ? 1 : 0; up = solid(x + 1, y, z) ? 1 : 0;
+	                vm = solid(x, y - 1, z) ? 1 : 0; vp = solid(x, y + 1, z) ? 1 : 0;
+	                break;
+	        }
+	        p = cornerAO(x, y, z, a, -1, -1, um, vm)
+	          | cornerAO(x, y, z, a,  1, -1, up, vm) << 2
+	          | cornerAO(x, y, z, a, -1,  1, um, vp) << 4
+	          | cornerAO(x, y, z, a,  1,  1, up, vp) << 6;
+	        AO.commit(key, p, !solidUnloaded);
 	    }
-
-	    final int a00 = cornerAO(x, y, z, a, -1, -1, um, vm);
-	    final int a10 = cornerAO(x, y, z, a,  1, -1, up, vm);
-	    final int a01 = cornerAO(x, y, z, a, -1,  1, um, vp);
-	    final int a11 = cornerAO(x, y, z, a,  1,  1, up, vp);
-
+	    final int a00 = p & 3, a10 = (p >> 2) & 3, a01 = (p >> 4) & 3, a11 = (p >> 6) & 3;
 	    final double lo = a00 + (a10 - a00) * fu;
 	    final double hi = a01 + (a11 - a01) * fu;
 	    return (lo + (hi - lo) * fv) / 3.0;
@@ -7493,30 +7682,26 @@ final class Render implements Callable<Void> {
 	// Keep skylight directional: one vertical ray per sample. Lateral rays caused
 	// skylight leakage around corners and made AO appear inconsistent.
 	private static final double[][] SKY_OFFSETS = { { 0, 0, 1 } }; // {dx, dz, weight}
+	private static final Cache SKY = new Cache(1 << 17), SHADOW = new Cache(1 << 17), AO = new Cache(1 << 18);
+	private static int cacheWorld = -1, cacheStream = -1;
+	private boolean solidUnloaded; // set by solid() when a probe hit an unloaded chunk
 
-	private final Memo skyMemo = new Memo(32768), shMemo = new Memo(16384), porousMemo = new Memo(8192);
-
-	/** One vertical sky ray from the middle of (cx, fy, cz). Payload 255 = open sky, otherwise contribution * 250. */
 	private int skyRay(long cx, long fy, long cz) {
-	    long epoch = ((long) Nexus.worldVer << 32) ^ (Nexus.streamVer & 0xFFFFFFFFL);
-	    long key = Memo.hash(cx, fy, cz, epoch ^ 13L);
-	    int p = skyMemo.get(key);
+	    final long key = Cache.hash(cx, fy, cz, 13L);
+	    int p = SKY.get(key);
 	    if (p >= 0) return p;
 	    boolean blocked = march((cx - pbx) + 0.5, (fy - pby) + 0.5, (cz - pbz) + 0.5, 0, -1, 0, SKY_RAY, false, false);
 	    if (blocked) p = (int) Math.round(Math.min(1, hT / 24.0) * 0.5 * 250);
 	    else if (hUnloaded && cave > 0.5) p = 125;
 	    else p = 255;
-	    // A ray that ended at an unloaded chunk is only a temporary estimate.
-	    // Avoid caching it so the proper skylight is calculated once terrain arrives.
 	    if (hUnloaded) skyUnloaded = true;
-	    else skyMemo.put(key, p);
+	    SKY.commit(key, p, !hUnloaded);
 	    return p;
 	}
 
 	private double skyLight(long fx, long fy, long fz) {
-	    long epoch = ((long) Nexus.worldVer << 32) ^ (Nexus.streamVer & 0xFFFFFFFFL);
-	    long key = Memo.hash(fx, fy, fz, epoch), key2 = Memo.hash(fx, fy, fz, epoch ^ 7L);
-	    int c = skyMemo.get(key), o = skyMemo.get(key2);
+	    final long key = Cache.hash(fx, fy, fz, 0x51L), key2 = Cache.hash(fx, fy, fz, 0x52L);
+	    int c = SKY.get(key), o = SKY.get(key2);
 	    if (c >= 0 && o >= 0) {
 	        skyOpen = o / 255.0;
 	        return c / 255.0;
@@ -7526,18 +7711,16 @@ final class Render implements Callable<Void> {
 	    for (double[] off : SKY_OFFSETS) {
 	        long cx = fx + (long) off[0], cz = fz + (long) off[1];
 	        double w = off[2];
-	        if (w != 2 && solid(cx, fy, cz)) continue; // lateral sample starts inside rock
+	        if (w != 2 && solid(cx, fy, cz)) continue;
 	        int p = skyRay(cx, fy, cz);
 	        wsum += w;
 	        if (p == 255) { total += w; openW += w; } else total += w * p / 250.0;
 	    }
 	    int q = (int) Math.round(total / wsum * 255);
 	    skyOpen = openW / wsum;
-	    // If any sample was incomplete, don't preserve the blended result either.
-	    if (!skyUnloaded) {
-	        skyMemo.put(key, q);
-	        skyMemo.put(key2, (int) Math.round(skyOpen * 255));
-	    }
+	    boolean done = !skyUnloaded;
+	    SKY.commit(key, q, done);
+	    SKY.commit(key2, (int) Math.round(skyOpen * 255), done);
 	    return q / 255.0;
 	}
 
@@ -8211,29 +8394,18 @@ final class Octree {
 	}
 }
 
-final class Memo {
-    private static final long K1 = 0x9E3779B97F4A7C15L;
-    private static final long K2 = 0xC2B2AE3D27D4EB4FL;
-    private static final long K3 = 0x165667B19E3779F9L;
-    private static final long K4 = 0x27D4EB2F165667C5L;
+final class Cache {
+    private static final long TAG = ~0xFFFFFFL; // top 40 bits = key tag, bits 8..23 = generation, low 8 = payload
+    private static final long K1 = 0x9E3779B97F4A7C15L, K2 = 0xC2B2AE3D27D4EB4FL, K3 = 0x165667B19E3779F9L, K4 = 0x27D4EB2F165667C5L;
 
-    private static final long REFRESH_INTERVAL_NS = 500_000_000L;
+    private final AtomicLongArray t;
+    private final int mask;
+    /** Written only by the main thread while workers are idle (the Semaphore handoff makes it visible). */
+    private int gen = 1;
 
-    final long[] t;
-    final int mask;
-
-    private int sweepCursor;
-    private long nextSweepAt;
-    private boolean clearRequested;
-    private boolean sweeping;
-
-    Memo(int size) {
-        if (size < 1 || (size & (size - 1)) != 0) {
-            throw new IllegalArgumentException(
-                "Memo size must be a power of two"
-            );
-        }
-        t = new long[size];
+    Cache(int size) {
+        if (size < 1 || (size & (size - 1)) != 0) throw new IllegalArgumentException("Cache size must be a power of two");
+        t = new AtomicLongArray(size);
         mask = size - 1;
     }
 
@@ -8245,72 +8417,30 @@ final class Memo {
         h ^= h >>> 32;
         h *= 0xD6E8FEB86659FD93L;
         h ^= h >>> 32;
-        return h | 0x100L;
+        return h;
     }
 
-    /**
-     * Request a refresh. Multiple requests are coalesced.
-     * This does not clear the cache immediately.
-     */
-    void requestClear() {
-        if (!sweeping) {
-            clearRequested = true;
-        }
-    }
-
-    /**
-     * Clears a small batch at most once every 500 ms.
-     * A full refresh takes approximately 16 seconds.
-     */
-    private void maintain() {
-        long now = System.nanoTime();
-
-        if (clearRequested && !sweeping) {
-            clearRequested = false;
-            sweeping = true;
-            sweepCursor = 0;
-            nextSweepAt = now;
-        }
-
-        if (!sweeping || now < nextSweepAt) {
-            return;
-        }
-
-        int batch = Math.max(1, t.length / 32);
-        int end = Math.min(t.length, sweepCursor + batch);
-
-        Arrays.fill(t, sweepCursor, end, 0L);
-        sweepCursor = end;
-        nextSweepAt = now + REFRESH_INTERVAL_NS;
-
-        if (sweepCursor >= t.length) {
-            sweeping = false;
-            sweepCursor = 0;
+    /** Instantly hides every entry. Main thread only, while no render worker is running. */
+    void invalidate() {
+        if (++gen > 0xFFFF) {
+            gen = 1;
+            for (int i = 0; i < t.length(); i++) t.lazySet(i, 0L);
         }
     }
 
     /** Payload 0..255, or -1 on a miss. */
     int get(long h) {
-        maintain();
-        long e = t[(int) (h >>> 20) & mask];
-        return ((e ^ h) & ~0xFFL) == 0 ? (int) (e & 0xFF) : -1;
+        long e = t.get((int) h & mask);
+        return ((e ^ h) & TAG) == 0 && ((int) (e >>> 8) & 0xFFFF) == gen ? (int) (e & 0xFF) : -1;
     }
 
-    void put(long h, int v) {
-        maintain();
-        t[(int) (h >>> 20) & mask] = (h & ~0xFFL) | (v & 0xFFL);
-    }
-
-    /** Immediate clear for explicit hard resets only. */
-    void clear() {
-        Arrays.fill(t, 0L);
-        sweepCursor = 0;
-        clearRequested = false;
-        sweeping = false;
-        nextSweepAt = 0L;
+    /** Publishes v only if the computation finished. Incomplete results are discarded. */
+    boolean commit(long h, int v, boolean complete) {
+        if (!complete) return false;
+        t.lazySet((int) h & mask, (h & TAG) | ((long) gen << 8) | (v & 0xFFL));
+        return true;
     }
 }
-
 
 final class SplitDecimal implements Comparable<SplitDecimal> {
     private static final double SPLITTER = 134217729.0;
