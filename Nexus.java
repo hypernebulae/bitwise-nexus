@@ -8,11 +8,13 @@ import java.io.*;
 import java.math.BigDecimal;
 import java.nio.file.*;
 import java.text.*;
+import java.time.Duration;
 import java.util.*;
 import java.util.List;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.*;
 import java.util.concurrent.locks.LockSupport;
+import java.util.random.*;
 import java.util.zip.*;
 
 import javax.sound.sampled.*;
@@ -22,13 +24,11 @@ import javax.swing.filechooser.FileNameExtensionFilter;
 
 import static bitwise.Nexus.*;
 
-@SuppressWarnings("serial")
 public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMotionListener, FocusListener, MouseWheelListener {
-	/** Player / previous-tick / interpolated-view position: 63-bit integer part + double fraction. */
 	static final SplitDecimal x = new SplitDecimal(), y = new SplitDecimal(), z = new SplitDecimal();
 	static final SplitDecimal prevX = new SplitDecimal(), prevY = new SplitDecimal(), prevZ = new SplitDecimal();
 	static final SplitDecimal viewX = new SplitDecimal(), viewY = new SplitDecimal(), viewZ = new SplitDecimal();
-	static final SplitDecimal TMP = new SplitDecimal(); // scratch, main thread only
+	static final SplitDecimal TMP = new SplitDecimal();
 	static final SplitDecimal worldSpawnX = new SplitDecimal(), worldSpawnY = new SplitDecimal(), worldSpawnZ = new SplitDecimal();
 	static volatile SplitDecimal[] hudPos = { new SplitDecimal(), new SplitDecimal(), new SplitDecimal() }; // EDT-safe snapshot
 	static double velX, velY, velZ, yaw = 1.2, pitch, fov = 90, focal = 160, sinYaw, sinPitch, cosYaw, cosPitch, amp = 1, flight = 0.1, sensitivity = Math.PI / 1800;
@@ -36,23 +36,33 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	static volatile boolean mouseLookArmed = false, worldLoading = false;
 	static volatile int mouseButtonsDown = 0;
 	static long worldLoadReadyAt = 0L;
-	public static byte scale = 1, detail = 1, option, heldBlock, reach = 5, power = 5;
+	public static byte scale = 1, detail = 1, option, heldBlock, reach = 5;
 	final static int SIZE = 64, SHIFT = 6, MASK = 63, VOL = SIZE * SIZE * SIZE;
 	public static short dist = 368, radius = 6;
 	static int width = 1280, height = 960, resX = 1, resY = 1;
 	final static int THREADS = Math.max(1, Runtime.getRuntime().availableProcessors());
-	final static int RENDER_THREADS = Math.max(1, Math.min(8, THREADS - 2));
-	final static int GEN_THREADS = Math.max(2, Math.min(4, THREADS / 2));
+	final static int RENDER_THREADS = Math.clamp(THREADS - 2, 1, 8);
+	final static int GEN_THREADS = Math.clamp(THREADS / 2, 2, 4);
 	static final long NO_POS = Long.MIN_VALUE;
 	volatile static long focusTime, hoveredX = NO_POS, hoveredY = NO_POS, hoveredZ = NO_POS, newHoverX = NO_POS, newHoverY = NO_POS, newHoverZ = NO_POS;
 	volatile static int dirX, dirY, dirZ, newDirX, newDirY, newDirZ;
 	static long activity = System.currentTimeMillis(), time, fps, frames, x0 = NO_POS, y0 = NO_POS, z0 = NO_POS, x1 = NO_POS, y1 = NO_POS, z1 = NO_POS, fpsTime = System.currentTimeMillis();
 	final static byte BLOCK_COUNT = 52, AXIS_X = 0, AXIS_Y = 1, AXIS_Z = 2, CROSS = 32, perlinRes = 127;
-	final static int MAGIC = 0x4E585339; // "NXS9"
-	final static int MAGIC_V8 = 0x4E585338; // "NXS8" (legacy)
+	final static int MAGIC = 0x4E585341;    // "NXSA" (3 x 64-bit chunk keys)
+	final static int MAGIC_V9 = 0x4E585339; // legacy packed keys
+	final static int MAGIC_V8 = 0x4E585338; // legacy
+	static final int SPWN_TAG = 0x5350574E, TELE_TAG = 0x54454C50;
+	static Pos3 homeKey;
+	static final LinkedHashMap<Pos3, Cold> chunkCache = new LinkedHashMap<>();
+	static final Map<Pos3, Cold> savedChunks = new HashMap<>();
+	static final HashSet<Pos3> jobKeys = new HashSet<>();
+	static final Map<Pos3, LongList> pendingWrites = new LinkedHashMap<>();
+	static final long[] EMPTY_LONGS = new long[0];
+	static final ArrayDeque<GenJob> jobs = new ArrayDeque<>();
+	record GenJob(long cx, long cy, long cz, Pos3 key, Future<Octree> future, boolean features, boolean cached, int epoch) {}
 	static final double[] PERLIN = new double[perlinRes + 1];
 	static volatile byte[] hotbar = new byte[]{};
-	public static String VERSION = "2.5.2";
+	public static String VERSION = "2.5.3";
 	volatile static String hoveredType;
 	static Vec3 light = new Vec3(0), sunColor = new Vec3(0), ambColor = new Vec3(0), skyColor = new Vec3(0);
 	static final Vec3 SUN_LOW = new Vec3(1, 0.5, 0), SUN_DAY = new Vec3(1), SUN_NIGHT = new Vec3(0.3, 0.3, 0.5);
@@ -79,14 +89,13 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	static final String SHARED_WORLDS_DIR = "worlds";
 	static volatile int settingsPage = 0; // 0 = General, 1 = Player / Render, 2 = World
 	static volatile boolean hideEverything = false, guiEnabled = false, controlsUIEnabled = false;
-	static volatile double pendingAmplitude = 1;
 	static volatile boolean musicEnabled = true;
 	static volatile double soundVolume = 1.0, musicVolume = 0.8;
 	static volatile boolean menuSliderDragging = false;
 	static volatile int menuSliderTarget = -1; // 0 flight, 1 render distance, 2 sensitivity, 3 sound volume, 4 music volume
 	static volatile String rgbEdit = "";
 	static volatile int rgbEditChannel = -1;
-	static int uiHoverX, uiHoverY, windowedWidth = width, windowedHeight = height;
+	static int windowedWidth = width, windowedHeight = height;
 	static Point windowedLocation;
 	static final BitSet input = new BitSet();
 	static final long[] cool = new long[1024];
@@ -106,7 +115,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	static final List<Render> workers = new ArrayList<>();
 	static long lcx = Long.MIN_VALUE, lcy, lcz;
 	static volatile boolean chunkDirty = true, needGround = true;
-	static final DecimalFormat FMT3 = new DecimalFormat("0.###"), FMT1 = new DecimalFormat("0.#\u00B0");
+	static final DecimalFormat FMT3 = new DecimalFormat("0.###"), FMT1 = new DecimalFormat("0.#°");
 	static Font guiFont;
 	static int guiFontScale = -1;
 	/** Unloaded chunks the player never edited are kept here and evicted oldest-first. 0 = no limit on that axis. */
@@ -130,37 +139,17 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	/** Block-light samples per block-face axis: 1, 2, 4, 8, or 16. */
 	static volatile int blockLightDensity = 16;
 	static boolean emits(byte b) { int i = b & 0xFF; return i < GLOW.length && GLOW[i] > 0; }
-	static final LinkedHashMap<Long, Object> chunkCache = new LinkedHashMap<>();
 	static int pendingCount;
-	static long homeKey = World.NONE;
 	static volatile long cacheBytes;
 	static boolean generating;
 	static volatile boolean[] OPAQUE = new boolean[256];
-	static final ExecutorService savePool = Executors.newSingleThreadExecutor(r -> { Thread t = new Thread(r, "nexus-save"); t.setDaemon(true); return t; });
+	static final ExecutorService savePool = Executors.newSingleThreadExecutor(Thread.ofPlatform().name("nexus-save").daemon().factory());
+	static final ExecutorService genPool = Executors.newFixedThreadPool(GEN_THREADS, Thread.ofPlatform().name("nexus-gen-", 0).daemon().priority(3).factory());
 	static final AtomicBoolean saveInProgress = new AtomicBoolean(false);
 	static volatile boolean saveRequested;
 	static volatile File requestedSaveFile;
 	static final Object SAVE_LOCK = new Object();
 	static volatile boolean shutdownSaveStarted;
-	// Bound background chunk generation so it cannot starve rendering or the main loop.
-	static final ExecutorService genPool = Executors.newFixedThreadPool(GEN_THREADS, r -> {
-		Thread t = new Thread(r, "nexus-gen");
-		t.setDaemon(true);
-		t.setPriority(3);
-		return t;
-	});
-	static final class GenJob {
-	    final long cx, cy, cz, key;
-	    final Future<Octree> future;
-	    final boolean features, cached;
-	    final int epoch;
-	    GenJob(long cx, long cy, long cz, long key, Future<Octree> future, boolean features, boolean cached, int epoch) {
-	        this.cx = cx; this.cy = cy; this.cz = cz; this.key = key; this.future = future;
-	        this.features = features; this.cached = cached; this.epoch = epoch;
-	    }
-	}
-	static final ArrayDeque<GenJob> jobs = new ArrayDeque<>();
-	static final HashSet<Long> jobKeys = new HashSet<>();
 	static final ArrayDeque<long[]> featureQueue = new ArrayDeque<>();
 	static int featureEpoch;
 	static final long FEATURE_BUDGET_NS = 4_000_000L; // max feature-pass time per frame
@@ -176,12 +165,10 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	static long lastChunkCleanup;
 	static double red = 0.3, green = 0.4, blue = 0.5;
 	static volatile boolean toggleFullscreenRequested;
-	static final byte[] EMPTY = new byte[0];
 	static final String[] NAMES = new String[BLOCK_COUNT];
 	static final Color HOTBAR_BG = new Color(0x33, 0x33, 0x33, 0x7F).darker(), HOTBAR_BORDER = Color.gray.darker();
 	static int page;
 	static boolean titleIdle;
-	static int zoomWidth = -1;
 	static final int MAX_LOAD_PER_PASS = 96;
 	static final int MAX_IN_FLIGHT = GEN_THREADS * 12;
 	static final long INSTALL_BUDGET_NS = 3_000_000L; // max time per frame spent installing finished chunks
@@ -199,7 +186,6 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	static final String[] LIGHT_NAMES = { "Basic", "AO + Glow", "AO + Skylight" };
 	static double caveMix;            // 0 = outside, 1 = deep underground (smoothed)
 	static final float[] GLOW = glow();
-	static final Map<Long, Object> savedChunks = new HashMap<>();
 	/** When enabled, every chunk is retained in the active .nexus save and restored before regeneration. */
 	static volatile boolean persistentStorage = false;
 	static volatile File activeSaveFile;
@@ -270,7 +256,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	static volatile boolean survival = false, createSurvival = false, dead = false, deathConfirm = false, leftDown = false;
 	static final int MAX_HEALTH = 5, INV_PAGES = 4, INV_SLOTS = 9, STACK_MAX = 99999;
 	static final long DAMAGE_COOLDOWN_MS = 500;
-	static final double FALL_SAFE = 15, FALL_EXTRA = 50; // 1 dmg at 15 blocks, +1 per extra 50
+	static final double FALL_SAFE = 10, FALL_EXTRA = 20; // 1 dmg at 10 blocks, +1 per extra 20
 	static volatile int health = MAX_HEALTH;
 	static long lastDamageMs;
 	static double fallDist;
@@ -464,7 +450,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		survival = s;
 		if (flightSpeed > 0 && Double.isFinite(flightSpeed)) flight = flightSpeed;
 		for (int p = 0; p < INV_PAGES; p++) { System.arraycopy(ids[p], 0, invId[p], 0, INV_SLOTS); System.arraycopy(cnt[p], 0, invCount[p], 0, INV_SLOTS); }
-		health = Math.max(0, Math.min(Activator.maxHealth(), hp));
+		health = Math.clamp(hp, 0, Activator.maxHealth());
 		dead = s && hp <= 0; deathConfirm = false; page = 0; heldBlock = 0;
 		fallDist = 0; lastDamageMs = System.currentTimeMillis(); leftDown = false;
 		resetBreak();
@@ -474,7 +460,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	/** Respawn: world spawn -> nearby spot -> random spot (repairSavedSpawnIfBlocked also saves the new spawn). */
 	static void respawn() {
 		flashUntil = 0;
-		flushDirty();                                            // so player edits are visible to the obstruction check
+		flushDirty();
 		repairSavedSpawnIfBlocked();
 		health = Activator.maxHealth(); dead = false; deathConfirm = false; fallDist = 0; lastDamageMs = System.currentTimeMillis(); fly = false;
 		resetBreak();
@@ -531,19 +517,19 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		for (int id = 1; id < 256; id++)
 			if (need[id] > 0 && takeFrom(ids, cnt, (byte) id, (int) Math.min(Integer.MAX_VALUE, need[id])) > 0) {
 				say("Not enough " + getType((byte) id) + " (" + need[id] + " needed)");
-				return false;
+				return true;
 			}
 		for (int id = 1; id < 256; id++)
 			if (repl[id] > 0 && giveTo(ids, cnt, (byte) id, (int) Math.min(Integer.MAX_VALUE, repl[id])) > 0) {
 				say("Inventory full - nothing changed");
-				return false;
+				return true;
 			}
 		for (int p = 0; p < INV_PAGES; p++) { System.arraycopy(ids[p], 0, invId[p], 0, INV_SLOTS); System.arraycopy(cnt[p], 0, invCount[p], 0, INV_SLOTS); }
-		return true;
+		return false;
 	}
 
 	private static boolean isLoaded(long x, long y, long z) {
-		return world.chunk(x >> SHIFT, y >> SHIFT, z >> SHIFT) != World.UNLOADED;
+		return world.chunk(x >> SHIFT, y >> SHIFT, z >> SHIFT) == World.UNLOADED;
 	}
 
 	/** Survival fill: costs one held-type block per changed voxel, refunds every block it replaces. */
@@ -552,17 +538,17 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		for (long a = x0; a < x1; a++)
 			for (long b = y0; b < y1; b++)
 				for (long c = z0; c < z1; c++) {
-					if (!isLoaded(a, b, c)) continue;
+					if (isLoaded(a, b, c)) continue;
 					byte cur = getBlock(a, b, c);
 					if (cur == block) continue;
 					if (block != AIR) need[block & 0xFF]++;
 					if (cur != AIR) repl[cur & 0xFF]++;
 				}
-		if (!commitInventory(need, repl)) return;
+		if (commitInventory(need, repl)) return;
 		fill(block, x0, y0, z0, x1, y1, z1, true);
 		chunkDirty = true;
 	}
-	static final Map<Long, LinkedHashSet<Long>> pendingWrites = new LinkedHashMap<>();
+
 	static final int DEEP_NEAR = 12, DEEP_NEAR2 = DEEP_NEAR * DEEP_NEAR; // chunks: full-depth loading inside this horizontal radius
 	static final double DEEP_CULL_MIX = 0.5;       // caveMix below this = player is on the surface, so cull deep far chunks
 	static final int UNDERGROUND_RADIUS_CAP = 24;  // chunks; underground fog hides anything farther
@@ -575,15 +561,34 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	    return (long) Math.ceil(Math.max(127 * amp, (127 + 100 * amp) * amp)) + 96;
 	}
 
-	/** Should this chunk be loaded right now? Same rule for loading, unloading and the feature-neighbour check. */
-	static boolean wantedAt(long nx, long ny, long nz, long pcx, long pcy, long pcz, int er, boolean cull, long bottom) {
-	    long dx = wrap21(nx - pcx), dy = wrap21(ny - pcy), dz = wrap21(nz - pcz);
-	    if (dx * dx + dy * dy + dz * dz > (long) er * er) return false;
-	    if (!cull || dx * dx + dz * dz <= DEEP_NEAR2) return true;
-	    return ny * SIZE <= bottom;
+	/** Exact 3x64-bit position. Used for chunk keys and block positions. */
+	record Pos3(long x, long y, long z) {
+		@Override public int hashCode() {
+			long h = x * 0x9E3779B97F4A7C15L;
+			h = (h ^ (h >>> 32)) + y * 0xC2B2AE3D27D4EB4FL;
+			h = (h ^ (h >>> 32)) + z * 0x165667B19E3779F9L;
+			h ^= h >>> 29;
+			return (int) (h ^ (h >>> 32));
+		}
 	}
 
-	public static void main(String[] args) {
+	/** Cold-storage chunk: either a live Octree or RLE bytes read from a file. Replaces the old `Object`. */
+	sealed interface Cold permits Octree, Raw {}
+
+	record Raw(byte[] bytes) implements Cold {
+		static final Raw EMPTY = new Raw(new byte[0]);
+	}
+
+	/** Primitive growable list: replaces LinkedHashSet<Long> (a boxed Long + entry per element). */
+	static final class LongList {
+		private long[] a = new long[8];
+		private int n;
+		void add(long v) { if (n == a.length) a = Arrays.copyOf(a, n << 1); a[n++] = v; }
+		int size() { return n; }
+		long get(int i) { return a[i]; }
+	}
+
+	static void main() {
 		deleteStaleTmp();
 		deleteOrphanBackups();
 		Runtime.getRuntime().addShutdownHook(new Thread(Nexus::saveOnShutdown, "nexus-shutdown-save"));
@@ -615,17 +620,29 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	}
 
 	static boolean isLeaves(byte b) {
-		return b == LEAVES || b == RED_LEAVES || b == ORANGE_LEAVES || b == YELLOW_LEAVES;
+		return switch (b) { case LEAVES, RED_LEAVES, ORANGE_LEAVES, YELLOW_LEAVES -> true; default -> false; };
 	}
 
 	private static int leafTint(int type, int x, int y, double pNoise) {
 		int light, dark;
-		switch (type) {
-		case RED_LEAVES:    light = 0xE03020; dark = 0xA82016; break;
-		case ORANGE_LEAVES: light = 0xFF8A1A; dark = 0xCC6A10; break;
-		case YELLOW_LEAVES: light = 0xF2D21C; dark = 0xC4A810; break;
-		default:            light = 0x00FF00; dark = 0x00CC00; break;
-		}
+        dark = switch (type) {
+            case RED_LEAVES -> {
+                light = 0xE03020;
+                yield 0xA82016;
+            }
+            case ORANGE_LEAVES -> {
+                light = 0xFF8A1A;
+                yield 0xCC6A10;
+            }
+            case YELLOW_LEAVES -> {
+                light = 0xF2D21C;
+                yield 0xC4A810;
+            }
+            default -> {
+                light = 0x00FF00;
+                yield 0x00CC00;
+            }
+        };
 		double dx = Math.abs((x & 3) - 2) * 2;
 		double dy = (y & 7) - 4;
 		if ((y / 8 & 1) == 1)
@@ -796,24 +813,14 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		return cachedRate;
 	}
 
+
 	private static void limitFrame(long frameStartNs) {
-	    if (!vSync)
-	        return;
-
-	    long frameDurationNs = 1_000_000_000L / getRefreshRate();
-	    long deadline = frameStartNs + frameDurationNs;
-
-	    while (true) {
-	        long remaining = deadline - System.nanoTime();
-	        if (remaining <= 0)
-	            break;
-
-	        if (remaining > 2_000_000L) {
-	            LockSupport.parkNanos(remaining - 1_000_000L);
-	        } else {
-	            Thread.yield();
-	        }
-	    }
+		if (!vSync) return;
+		final long deadline = frameStartNs + 1_000_000_000L / getRefreshRate();
+		for (long remaining; (remaining = deadline - System.nanoTime()) > 0;) {
+			if (remaining > 2_000_000L) LockSupport.parkNanos(remaining - 1_000_000L);
+			else Thread.onSpinWait();
+		}
 	}
 
 	static String getType(byte block) {
@@ -822,90 +829,151 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		return n != null ? n : "Block " + block;
 	}
 
-	private static long sizeOf(Object o) {
-		return (o instanceof Octree ? ((Octree) o).memoryBytes() : ((byte[]) o).length + 16) + 64; // + map entry
+	private static long sizeOf(Cold c) {
+		return (switch (c) {
+			case Octree o -> o.memoryBytes();
+			case Raw r -> r.bytes().length + 16L;
+		}) + 64;
 	}
 
 	static void clearSaved() {
 		userTopY = Long.MAX_VALUE;
-		savedChunks.clear();
-		chunkCache.clear();
-		cacheBytes = 0;
-		pendingWrites.clear();
-		pendingCount = 0;
+		savedChunks.clear(); chunkCache.clear(); cacheBytes = 0;
+		pendingWrites.clear(); pendingCount = 0;
+		Activator.clearTeleporters();
 	}
 
-	/** Evict oldest regenerable chunks until both limits are satisfied. Safe to call any time (main thread). */
+	/** Evict oldest regenerable chunks until both limits are satisfied. */
 	static void evictCache() {
-		int maxN = CACHE_MAX_CHUNKS;
-		long maxB = CACHE_MAX_BYTES;
-		if (maxN <= 0 && maxB <= 0)
-			return;
-		Iterator<Map.Entry<Long, Object>> it = chunkCache.entrySet().iterator();
-		while (it.hasNext() && ((maxN > 0 && chunkCache.size() > maxN) || (maxB > 0 && cacheBytes > maxB))) {
-			cacheBytes -= sizeOf(it.next().getValue());
-			it.remove();
-		}
+		final int maxN = CACHE_MAX_CHUNKS;
+		final long maxB = CACHE_MAX_BYTES;
+		if (maxN <= 0 && maxB <= 0) return;
+		while (!chunkCache.isEmpty() && ((maxN > 0 && chunkCache.size() > maxN) || (maxB > 0 && cacheBytes > maxB)))
+			cacheBytes -= sizeOf(chunkCache.pollFirstEntry().getValue()); // SequencedMap, Java 21+
 	}
 
-	static void stash(long key, Octree data, boolean user) {
-		Object v;
-		if (data == null) {
-			v = EMPTY;
-		} else {
-			data.compact();
-			v = data;
-		}
-		Object old = chunkCache.remove(key);
-		if (old != null)
-			cacheBytes -= sizeOf(old);
+	static void stash(Pos3 key, Octree data, boolean user) {
+		final Cold v;
+		if (data == null) v = Raw.EMPTY;
+		else { data.compact(); v = data; }
+		final Cold old = chunkCache.remove(key);
+		if (old != null) cacheBytes -= sizeOf(old);
 		if (user || savedChunks.containsKey(key)) { // player-edited: permanent
 			dropPending(key);
-			userTopY = Math.min(userTopY, World.unpackY(key) * SIZE);
+			userTopY = Math.min(userTopY, key.y() * SIZE);
 			savedChunks.put(key, v);
 			return;
 		}
-		chunkCache.put(key, v); // re-inserted at the newest end
+		chunkCache.put(key, v);
 		cacheBytes += sizeOf(v);
 		evictCache();
 	}
 
-	/** Persist (if edited) and unload one ring slot. */
 	static void unloadSlot(int s) {
-		long k = world.keys[s];
-		if (k == World.NONE)
-			return;
-		// Only retain chunks that contain player-made block changes.
-		if (world.user[s])
-			stash(k, world.data[s], true);
-		world.keys[s] = World.NONE;
-		world.data[s] = null;
-		world.dirty[s] = false;
-		world.user[s] = false;
+		if (!world.present[s]) return;
+		if (world.user[s]) stash(world.keyAt(s), world.data[s], true); // only retain player-made changes
+		world.vacate(s);
 	}
 
-	/** Keep player edits across a clear/resize/save. Generation-only edits are simply regenerated. */
 	static void flushDirty() {
-		for (int s = 0; s < world.keys.length; s++)
-			if (world.keys[s] != World.NONE && world.dirty[s] && world.user[s]) {
-				stash(world.keys[s], world.data[s], true);
+		for (int s = 0; s < world.present.length; s++)
+			if (world.present[s] && world.dirty[s] && world.user[s]) {
+				stash(world.keyAt(s), world.data[s], true);
 				world.dirty[s] = false;
 			}
 	}
 
-	/** Cold-storage entry (Octree, or RLE bytes from a file) back to a live chunk. */
-	static Octree restore(Object saved) {
-		if (saved instanceof Octree)
-			return (Octree) saved;
-		byte[] b = (byte[]) saved;
-		return b.length == 0 ? null : Octree.build(decodeInto(b, GEN_DENSE.get()));
+	static Octree restore(Cold saved) {
+		return switch (saved) {
+			case Octree o -> o;
+			case Raw r -> r.bytes().length == 0 ? null : Octree.build(decodeInto(r.bytes(), GEN_DENSE.get()));
+		};
 	}
 
-	static byte[] blobOf(Object o) {
-		if (o instanceof byte[]) return (byte[]) o;
-		byte[] dense = SAVE_DENSE.get();
-		((Octree) o).toDense(dense);
-		return encode(dense);
+	static byte[] blobOf(Cold c) {
+		return switch (c) {
+			case Raw r -> r.bytes();
+			case Octree o -> { byte[] dense = SAVE_DENSE.get(); o.toDense(dense); yield encode(dense); }
+		};
+	}
+
+	/** Overflow-safe "inside the sphere of radius r" for raw 64-bit differences. */
+	static boolean within(long dx, long dy, long dz, long r) {
+		if (dx > r || dx < -r || dy > r || dy < -r || dz > r || dz < -r) return false;
+		return dx * dx + dy * dy + dz * dz <= r * r;
+	}
+
+	static boolean wantedAt(long nx, long ny, long nz, long pcx, long pcy, long pcz, int er, boolean cull, long bottom) {
+		final long dx = nx - pcx, dy = ny - pcy, dz = nz - pcz;
+		if (!within(dx, dy, dz, er)) return false;
+		if (!cull || dx * dx + dz * dz <= DEEP_NEAR2) return true;
+		return ny * SIZE <= bottom;
+	}
+
+	static void cleanupOldChunks(boolean force) {
+		final long now = System.currentTimeMillis();
+		if (!force && now - lastChunkCleanup < 1000L) return;
+		lastChunkCleanup = now;
+		final long cx = chunkOf(x), cy = chunkOf(y), cz = chunkOf(z);
+		final long cutoff = force ? Long.MAX_VALUE : now - 10000;
+		final boolean cull = caveMix < DEEP_CULL_MIX;
+		final long bottom = surfaceBottom();
+		for (int s = 0; s < world.present.length; s++) {
+			if (!world.present[s] || world.seen[s] >= cutoff) continue;
+			if (!wantedAt(world.kx[s], world.ky[s], world.kz[s], cx, cy, cz, radius, cull, bottom)) unloadSlot(s);
+		}
+		prunePending(cx, cy, cz, force);
+		evictCache();
+	}
+
+	static long lastPrune;
+	private static void prunePending(long cx, long cy, long cz, boolean force) {
+		final long now = System.currentTimeMillis();
+		if (!force && now - lastPrune < 5000L) return;
+		lastPrune = now;
+		final long lim = radius + 2;
+		for (var it = pendingWrites.entrySet().iterator(); it.hasNext();) {
+			var e = it.next();
+			final Pos3 k = e.getKey();
+			if (!within(k.x() - cx, k.y() - cy, k.z() - cz, lim)) { pendingCount -= e.getValue().size(); it.remove(); }
+		}
+	}
+
+	private static void drainFinished() {
+		if (jobs.isEmpty()) return;
+		if (featureEpoch != world.epoch) { featureQueue.clear(); featureEpoch = world.epoch; }
+		final long end = System.nanoTime() + INSTALL_BUDGET_NS;
+		final long pcx = chunkOf(x), pcy = chunkOf(y), pcz = chunkOf(z);
+		boolean any = false;
+		for (Iterator<GenJob> it = jobs.iterator(); it.hasNext();) {
+			final GenJob j = it.next();
+			if (j.epoch() != world.epoch) { j.future().cancel(true); it.remove(); jobKeys.remove(j.key()); continue; }
+			final boolean far = !within(j.cx() - pcx, j.cy() - pcy, j.cz() - pcz, radius);
+			if (!j.future().isDone()) {
+				if (far) { j.future().cancel(false); it.remove(); jobKeys.remove(j.key()); }
+				continue;
+			}
+			if (System.nanoTime() >= end) break;
+			it.remove(); jobKeys.remove(j.key());
+			any = true;
+			if (far) continue;
+			Octree d = null;
+			switch (j.future().state()) {
+				case SUCCESS -> d = j.future().resultNow();
+				case FAILED -> j.future().exceptionNow().printStackTrace();
+				default -> { }
+			}
+			final int slot = world.slot(j.cx(), j.cy(), j.cz());
+			unloadSlot(slot);
+			world.put(j.cx(), j.cy(), j.cz(), d);
+			if (d != null) userTopY = Math.min(userTopY, j.cy() * SIZE);
+			if (j.cached()) world.dirty[slot] = true;
+			if (j.features()) {
+				applyPending(j.cx(), j.cy(), j.cz());
+				featureQueue.add(new long[] { j.cx(), j.cy(), j.cz() });
+			}
+		}
+		if (any) chunkDirty = true;
 	}
 
 	static byte[] decodeInto(byte[] data, byte[] out) {
@@ -936,13 +1004,12 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		double t = (windowWidth - AUTO_FOV_BASE_WIDTH) / (double) (AUTO_FOV_REFERENCE_WIDTH - AUTO_FOV_BASE_WIDTH);
 		double value = AUTO_FOCAL_BASE + (AUTO_FOCAL_REFERENCE - AUTO_FOCAL_BASE) * t;
 		value = Math.round(value / 5.0) * 5.0;
-		value = Math.max(AUTO_FOCAL_MIN, Math.min(AUTO_FOCAL_MAX, value));
+		value = Math.clamp(value, AUTO_FOCAL_MIN, AUTO_FOCAL_MAX);
 		return Math.toDegrees(2 * Math.atan(windowWidth / (8.0 * value)));
 	}
 
-	/** Set the true horizontal field of view (degrees, 0-180) and the projection scale derived from it. */
 	static void setFov(double degrees) {
-		fov = Math.max(FOV_MIN, Math.min(FOV_MAX, degrees));
+		fov = Math.clamp(degrees, FOV_MIN, FOV_MAX);
 		focal = Math.max(8, width) / (8.0 * Math.tan(Math.toRadians(fov) / 2));
 	}
 
@@ -1060,16 +1127,16 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	}
 
 	static int kind(byte b) {
-		switch (b) {
-		case DIRT: case CLAY: case GRAVEL: case SNOW: return 1;
-		case GRASS: case LEAVES: case MOSS: case RED_LEAVES: case ORANGE_LEAVES: case YELLOW_LEAVES: case AUTUMN_GRASS: return 2;
-		case OAK_LOG: case OAK_PLANKS: case BIRCH_LOG: case BIRCH_PLANKS: return 3;
-		case ICE: case TOPAZ: case EMERALD: case RUBY: case SAPPHIRE: case AMETHYST: case TANZANITE: case RHODONITE: case DIAMOND: case QUARTZ: return 4;
-		case SAND: case ASH: return 5;
-		case IRON: case COPPER: case GOLD: return 6;
-		case MAGMA: case GLASS: case OBSIDIAN: return 7;
-		default: return 0;
-		}
+		return switch (b) {
+			case DIRT, CLAY, GRAVEL, SNOW -> 1;
+			case GRASS, LEAVES, MOSS, RED_LEAVES, ORANGE_LEAVES, YELLOW_LEAVES, AUTUMN_GRASS -> 2;
+			case OAK_LOG, OAK_PLANKS, BIRCH_LOG, BIRCH_PLANKS -> 3;
+			case ICE, TOPAZ, EMERALD, RUBY, SAPPHIRE, AMETHYST, TANZANITE, RHODONITE, DIAMOND, QUARTZ -> 4;
+			case SAND, ASH -> 5;
+			case IRON, COPPER, GOLD -> 6;
+			case MAGMA, GLASS, OBSIDIAN -> 7;
+			default -> 0;
+		};
 	}
 
 	static float[] make(double[] k, double len, double pitch, long seed) {
@@ -1169,12 +1236,12 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 			if ("1".equals(BYTEBEAT[i][3]) == rare && i != exclude) bag.add(i);
 		Collections.shuffle(bag, RND);
 		int n = bag.size();
-		if (n > 1 && bag.get(n - 1) == lastTrack) Collections.swap(bag, n - 1, 0);
+		if (n > 1 && bag.getLast() == lastTrack) Collections.swap(bag, n - 1, 0);
 	}
 
 	static int draw(ArrayList<Integer> bag, boolean rare) {
 		if (bag.isEmpty()) refill(bag, rare, -1);
-		return bag.isEmpty() ? -1 : bag.remove(bag.size() - 1);
+		return bag.isEmpty() ? -1 : bag.removeLast();
 	}
 
 	static int nextTrack() {
@@ -1186,32 +1253,34 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	}
 
 	static void musicLoop() {
-		try { Thread.sleep(60000); } catch (InterruptedException e) { Thread.currentThread().interrupt(); return; }
+		try { Thread.sleep(Duration.ofSeconds(60)); } catch (InterruptedException _) { Thread.currentThread().interrupt(); return; }
 		while (true) {
 			try {
 				if (!musicEnabled) { Thread.sleep(1000); continue; }
-				String[] track = BYTEBEAT[nextTrack()];
-				int rate = Integer.parseInt(track[2]);
-				short[] samples = renderBytebeat(track, rate);
+				final String[] track = BYTEBEAT[nextTrack()];
+				final int rate = Integer.parseInt(track[2]);
+				final short[] samples = renderBytebeat(track, rate);
 				musicVoice = new MusicVoice(samples, samples.length, rate);
 				say("Now playing: " + track[0] + " by " + track[1]);
-				while (musicVoice != null && !musicVoice.finished()) Thread.sleep(100);
+				while (musicVoice != null && !musicVoice.finished() && musicEnabled) Thread.sleep(100);
 				musicVoice = null;
-				Thread.sleep(60000);
+				Thread.sleep(Duration.ofSeconds(60));
+			} catch (InterruptedException _) {
+				Thread.currentThread().interrupt(); return;
 			} catch (Throwable e) {
 				System.err.println("Bytebeat player error: " + e);
 				e.printStackTrace();
 				musicVoice = null;
-				try { Thread.sleep(5000); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); return; }
+				try { Thread.sleep(5000); } catch (InterruptedException _) { Thread.currentThread().interrupt(); return; }
 			}
 		}
 	}
 
-	static short[] renderBytebeat(String[] track, int rate) throws Exception {
-		return renderBytebeatJava(track[0], rate * BB_MAX_SECONDS, rate);
+	static short[] renderBytebeat(String[] track, int rate) {
+		return renderBytebeatJava(track[0], rate * BB_MAX_SECONDS);
 	}
 
-	static short[] renderBytebeatJava(String name, int count, int rate) {
+	static short[] renderBytebeatJava(String name, int count) {
 		short[] out = new short[count];
 		double[] rev = new double[12288]; int rp = 0; double[] delay = new double[120000];
 		double[] echo = "echo_testing".equals(name) ? new double[12287] : null;
@@ -1512,11 +1581,9 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 					SwingUtilities.invokeLater(() -> frame.setTitle(t));
 				}
 				if (idle) {
-					try { Thread.sleep(200); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+					try { Thread.sleep(200); } catch (InterruptedException _) { Thread.currentThread().interrupt(); }
 				}
-				Runnable task;
-				while ((task = tasks.poll()) != null)
-					task.run();
+				drainTasks();
 
 				long autosaveNow = System.currentTimeMillis();
 				// The title-screen preview reuses the renderer/camera, but it is not a playable
@@ -1537,7 +1604,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 				if (paused || dialogOpen) {
 					// Keep menus/dialogs responsive while suspending simulation.
 					sigValid = false;
-					try { Thread.sleep(80); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+					try { Thread.sleep(80); } catch (InterruptedException _) { Thread.currentThread().interrupt(); }
 					continue;
 				}
 
@@ -1547,7 +1614,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 				    if (nowNs - lastMenuFrameNs < 33_333_333L) {
 				        try {
 				            Thread.sleep(33);
-				        } catch (InterruptedException e) {
+				        } catch (InterruptedException _) {
 				            Thread.currentThread().interrupt();
 				        }
 				        continue;
@@ -1648,6 +1715,13 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		}
 	}
 
+	private static void drainTasks() {
+		Runnable t;
+		while ((t = tasks.poll()) != null) {
+			try { t.run(); } catch (Throwable e) { e.printStackTrace(); }
+		}
+	}
+
 	private static void mainMenuPosition(boolean resetYaw, boolean resetDist) {
 		fly = true;
 		velX = velY = velZ = 0;
@@ -1669,7 +1743,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 
 	private void takeScreenshot() {
 		try {
-			Path dir = Paths.get("screenshots"); Files.createDirectories(dir);
+			Path dir = Path.of("screenshots"); Files.createDirectories(dir);
 			String stamp = new SimpleDateFormat("yyyyMMdd-HHmmss").format(new Date());
 			Path file = dir.resolve("Nexus-" + stamp + ".png");
 			BufferedImage shot = new BufferedImage(width, height, 1);
@@ -1781,7 +1855,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 
 	static void renderFrame() {
 		// Do not wake more workers than there are tiles to render.
-		int active = Math.min(workers.size(), Math.max(1, Render.tilesTotal));
+		int active = Math.clamp(Render.tilesTotal, 1, workers.size());
 		for (int i = 0; i < active; i++) workers.get(i).go.release();
 		try { mainRender.call(); } catch (Throwable e) { e.printStackTrace(); } // joins the shared tile queue
 		finished.acquireUninterruptibly(active);
@@ -1791,7 +1865,6 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	private static long lastSig, lastSigTime;
 	private static boolean sigValid;
 	static boolean shadowRetry;
-	static long lastHealTime;
 
 	private static long sigMix(long h, long v) { h = (h ^ v) * 0x9E3779B97F4A7C15L; return h ^ (h >>> 31); }
 
@@ -2092,11 +2165,6 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		return r;
 	}
 
-	/** Wraps a chunk-coordinate difference into the signed 21-bit range the chunk keys use. */
-	static long wrap21(long d) {
-		return (d << 43) >> 43;
-	}
-
 	private static boolean featureNeighboursReady(long cx, long cy, long cz, long pcx, long pcy, long pcz, int er, boolean cull, long bottom) {
 	    for (byte dx = -1; dx <= 1; dx++)
 	        for (byte dy = -1; dy <= 1; dy++)
@@ -2128,7 +2196,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	            if (m == null) break;
 	            if (!world.has(m[0], m[1], m[2])) continue; // unloaded while waiting; a reload queues it again
 	            if (!featureNeighboursReady(m[0], m[1], m[2], pcx, pcy, pcz, er, cull, bottom)) { featureQueue.add(m); continue; }
-	            homeKey = World.key(m[0], m[1], m[2]);
+				homeKey = new Pos3(m[0], m[1], m[2]);
 	            features(m[0], m[1], m[2]);
 	            autumnForestFeatures(m[0], m[1], m[2]);
 	            caveFeatures(m[0], m[1], m[2]);
@@ -2147,81 +2215,11 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	        }
 	    } finally {
 	        generating = false;
-	        homeKey = World.NONE;
+	        homeKey = null;
 	    }
 	}
 
 	private static void cleanupOldChunks() { cleanupOldChunks(false); }
-
-	/** force = skip the 1 s throttle and the 10 s grace period (used right after a teleport). */
-	static void cleanupOldChunks(boolean force) {
-	    long now = System.currentTimeMillis();
-	    if (!force && now - lastChunkCleanup < 1000L) return;
-	    lastChunkCleanup = now;
-	    long cx = chunkOf(x), cy = chunkOf(y), cz = chunkOf(z);
-	    long cutoff = force ? Long.MAX_VALUE : now - 10000;
-	    final boolean cull = caveMix < DEEP_CULL_MIX;
-	    final long bottom = surfaceBottom();
-	    for (int s = 0; s < world.keys.length; s++) {
-	        long k = world.keys[s];
-	        if (k == World.NONE || world.seen[s] >= cutoff) continue;
-	        if (!wantedAt(World.unpackX(k), World.unpackY(k), World.unpackZ(k), cx, cy, cz, radius, cull, bottom))
-	            unloadSlot(s);
-	    }
-	    prunePending(cx, cy, cz, force);
-	    evictCache();
-	}
-
-	static long lastPrune;
-	/** Feature writes aimed at chunks far from the player can never be needed again: drop them. */
-	private static void prunePending(long cx, long cy, long cz, boolean force) {
-	    long now = System.currentTimeMillis();
-	    if (!force && now - lastPrune < 5000L) return;
-	    lastPrune = now;
-	    long lim = (long) (radius + 2) * (radius + 2);
-	    Iterator<Map.Entry<Long, LinkedHashSet<Long>>> it = pendingWrites.entrySet().iterator();
-	    while (it.hasNext()) {
-	        Map.Entry<Long, LinkedHashSet<Long>> e = it.next();
-	        long k = e.getKey();
-	        long dx = wrap21(World.unpackX(k) - cx), dy = wrap21(World.unpackY(k) - cy), dz = wrap21(World.unpackZ(k) - cz);
-	        if (dx * dx + dy * dy + dz * dz > lim) { pendingCount -= e.getValue().size(); it.remove(); }
-	    }
-	}
-
-	/** Installs every finished chunk (nearest first) within a small time budget; drops stale/far jobs. */
-	private static void drainFinished() {
-	    if (jobs.isEmpty()) return;
-	    if (featureEpoch != world.epoch) { featureQueue.clear(); featureEpoch = world.epoch; }
-	    final long end = System.nanoTime() + INSTALL_BUDGET_NS;
-	    final long pcx = chunkOf(x), pcy = chunkOf(y), pcz = chunkOf(z), r2 = (long) radius * radius;
-	    boolean any = false;
-	    for (Iterator<GenJob> it = jobs.iterator(); it.hasNext();) {
-	        GenJob j = it.next();
-	        if (j.epoch != world.epoch) { j.future.cancel(true); it.remove(); jobKeys.remove(j.key); continue; }
-	        long dx = j.cx - pcx, dy = j.cy - pcy, dz = j.cz - pcz;
-	        boolean far = dx * dx + dy * dy + dz * dz > r2;
-	        if (!j.future.isDone()) {
-	            if (far) { j.future.cancel(false); it.remove(); jobKeys.remove(j.key); }
-	            continue;
-	        }
-	        if (System.nanoTime() >= end) break;
-	        it.remove(); jobKeys.remove(j.key);
-	        any = true;
-	        if (far) continue;
-	        Octree d = null;
-	        try { d = j.future.get(); } catch (Exception e) { e.printStackTrace(); }
-	        int slot = world.slot(j.cx, j.cy, j.cz);
-	        unloadSlot(slot);
-	        world.put(j.cx, j.cy, j.cz, d);
-	        if (d != null) userTopY = Math.min(userTopY, j.cy * SIZE);
-	        if (j.cached) world.dirty[slot] = true;
-	        if (j.features) {
-	            applyPending(j.cx, j.cy, j.cz);
-	            featureQueue.add(new long[] { j.cx, j.cy, j.cz });
-	        }
-	    }
-	    if (any) chunkDirty = true;
-	}
 
 	/** Chunk offsets inside the load sphere, nearest first, packed as three biased bytes. */
 	private static int[] loadOrder(int r) {
@@ -2292,14 +2290,14 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	        if (m >= room && (long) (d2 * 16) > bound16) { cut = true; break; }
 	        final long qx = cx + dx, qy = cy + dy, qz = cz + dz;
 	        if (cull && dx * dx + dz * dz > DEEP_NEAR2 && qy * SIZE > bottom) continue; // deep and far: invisible
-	        if (world.has(qx, qy, qz)) continue;
-	        if (!jobKeys.isEmpty() && jobKeys.contains(World.key(qx, qy, qz))) continue;
-	        if (instant < INSTANT_MAX && qy * SIZE + SIZE - 1 < airLimit && !savedChunks.containsKey(World.key(qx, qy, qz))) {
-	            unloadSlot(world.slot(qx, qy, qz)); // empty sky: no worker job needed
-	            world.put(qx, qy, qz, null);
-	            instant++;
-	            continue;
-	        }
+			if (world.has(qx, qy, qz)) continue;
+			if (!jobKeys.isEmpty() && jobKeys.contains(new Pos3(qx, qy, qz))) continue;
+			if (instant < INSTANT_MAX && qy * SIZE + SIZE - 1 < airLimit && (savedChunks.isEmpty() || !savedChunks.containsKey(new Pos3(qx, qy, qz)))) {
+				unloadSlot(world.slot(qx, qy, qz)); // empty sky: no worker job needed
+				world.put(qx, qy, qz, null);
+				instant++;
+				continue;
+			}
 	        double len = Math.sqrt(d2);
 	        double facing = len == 0 ? 1 : (dx * fx + dy * fy + dz * fz) / len;
 	        cand[m++] = (long) ((d2 + 6.0 * (1 - facing)) * 16) << 24 | o;
@@ -2312,33 +2310,21 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	    if (instant >= INSTANT_MAX) chunkDirty = true;
 	    final int n = Math.min(m, room);
 	    selectSmallest(cand, m, n);
-	    if (m > n || cut) chunkDirty = true;
-	    if (n == 0) return;
-
-	    final int epoch = world.epoch;
-	    for (int i = 0; i < n; i++) {
-	        int o = (int) (cand[i] & 0xFFFFFF);
-	        final long qx = cx + (o & 255) - 128, qy = cy + ((o >> 8) & 255) - 128, qz = cz + ((o >> 16) & 255) - 128;
-	        final long key = World.key(qx, qy, qz);
-	        Object saved = savedChunks.get(key);
-	        boolean cached = false;
-	        if (saved == null && (saved = chunkCache.remove(key)) != null) {
-	            cacheBytes -= sizeOf(saved);
-	            cached = true;
-	        }
-	        final Object restoreValue = saved;
-	        Future<Octree> f;
-	        boolean features;
-	        if (restoreValue != null) {
-	            f = genPool.submit(() -> restore(restoreValue));
-	            features = false;
-	        } else {
-	            f = genPool.submit(() -> generate(qx, qy, qz));
-	            features = true;
-	        }
-	        jobs.add(new GenJob(qx, qy, qz, key, f, features, cached, epoch));
-	        jobKeys.add(key);
-	    }
+		final int epoch = world.epoch;
+		for (int i = 0; i < n; i++) {
+			final int o = (int) (cand[i] & 0xFFFFFF);
+			final long qx = cx + (o & 255) - 128, qy = cy + ((o >> 8) & 255) - 128, qz = cz + ((o >> 16) & 255) - 128;
+			final Pos3 key = new Pos3(qx, qy, qz);
+			Cold saved = savedChunks.get(key);
+			boolean cached = false;
+			if (saved == null && (saved = chunkCache.remove(key)) != null) { cacheBytes -= sizeOf(saved); cached = true; }
+			final Cold restoreValue = saved;
+			final Future<Octree> f;
+			final boolean features = restoreValue == null;
+			f = features ? genPool.submit(() -> generate(qx, qy, qz)) : genPool.submit(() -> restore(restoreValue));
+			jobs.add(new GenJob(qx, qy, qz, key, f, features, cached, epoch));
+			jobKeys.add(key);
+		}
 	}
 
 	static final double TBASE = 160, TDIV = 24, TK = 10;
@@ -2375,10 +2361,6 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	    return m <= 0 ? v : v + (1.6 - v) * m;
 	}
 
-	static double density(double wx, double wy, double wz) {
-	    return density(wx, wy, wz, plainsAt(wx, wz), mountainLift(wx, wz));
-	}
-
 	static double density(double wx, double wy, double wz, double plains, double lift) {
 	    double rough = 0, flat = 0;
 	    if (plains < 1.0)
@@ -2393,7 +2375,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 
 	static double smoothstep(double edge0, double edge1, double x) {
 		double t = (x - edge0) / (edge1 - edge0);
-		t = Math.max(0.0, Math.min(1.0, t));
+		t = Math.clamp(t, 0.0, 1.0);
 		return t * t * (3.0 - 2.0 * t);
 	}
 
@@ -2941,8 +2923,8 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		Octree d = world.chunk(cx, cy, cz);
 		if ((!snowY && !magmaY) || d == null || d == World.UNLOADED)
 			return;
-		Random r = new Random(World.key(cx, cy, cz) ^ 0x1C1C1EL);
-		Random rg = new Random(World.key(cx, cy, cz) ^ 0x6E57C0L);
+		Random r = new Random(World.seed(cx, cy, cz) ^ 0x1C1C1EL);
+		Random rg = new Random(World.seed(cx, cy, cz) ^ 0x6E57C0L);
 		for (int lx = 0; lx < SIZE; lx += 4)
 			for (int ly = 0; ly < SIZE; ly += 4)
 				for (int lz = 0; lz < SIZE; lz += 4) {
@@ -3241,7 +3223,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 				double[] b = basinAt(gx, gz);
 				if (b == null)
 					continue;
-				Random r = new Random(World.key(cx, cy, cz) ^ (gx * 31 + gz) ^ 0xBA51L);
+				Random r = new Random(World.seed(cx, cy, cz) ^ (gx * 31 + gz) ^ 0xBA51L);
 				if ((int) b[6] == CB_SNOW)
 					basinIcicles(b, r, baseX, baseY, baseZ);
 				else
@@ -3328,7 +3310,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	    for (int i = -1; i <= 1; i++)
 	        for (int j = -1; j <= 1; j++)
 	            base = Math.max(base, mengerSurfaceY(ax + i * (PYR_H - 10), az + j * (PYR_H - 10)));
-	    byte block = new Random(World.key(gx, 0, gz) ^ 0x7079L).nextBoolean() ? CHECKERBOARD : TILE;
+	    byte block = new Random(World.seed(gx, 0, gz) ^ 0x7079L).nextBoolean() ? CHECKERBOARD : TILE;
 	    return new PyramidSite(ax, az, base, block);
 	}
 
@@ -3405,7 +3387,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	    if (plains < 0.65 ? slope > 32 : slope > 14) return new MengerSite(gx, gz);
 	    double iterRoll = hash3(ix, 0, iz, 0x4D5354);
 	    int size = iterRoll < 0.60 ? 9 : iterRoll < 0.90 ? 27 : 81;
-	    byte block = new Random(World.key(gx, 0, gz) ^ 0x4D454E474552L).nextBoolean() ? BRICKS : OAK_PLANKS;
+	    byte block = new Random(World.seed(gx, 0, gz) ^ 0x4D454E474552L).nextBoolean() ? BRICKS : OAK_PLANKS;
 	    return new MengerSite(gx, gz, ax, az, mengerSurfaceY(ax, az), size, block);
 	}
 
@@ -3479,7 +3461,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 				return;
 		}
 
-		Random r = new Random(World.key(cx, cy, cz) ^ 0xA07F0E57L);
+		Random r = new Random(World.seed(cx, cy, cz) ^ 0xA07F0E57L);
 
 		// No chunk-border margin: attempt trees across the entire chunk.
 		for (int lx = 0; lx < SIZE; lx += AUTUMN_TREE_SPACING) {
@@ -3641,7 +3623,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		if (d0 == null || d0 == World.UNLOADED) return;
 		if (cy * SIZE > surfaceBottom() || cy * SIZE + SIZE <= topBound()) return;
 	    long baseX = cx * SIZE, baseY = cy * SIZE, baseZ = cz * SIZE;
-	    long colKey = World.key(cx, 0, cz);
+	    long colKey = World.seed(cx, 0, cz);
 	    for (int lx = 3; lx < SIZE - 3; lx += 6) {
 	        for (int lz = 3; lz < SIZE - 3; lz += 6) {
 	            long wx = baseX + lx, wz = baseZ + lz;
@@ -3734,41 +3716,36 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		return c.get((byte) (x & MASK), (byte) (y & MASK), (byte) (z & MASK));
 	}
 
+	private static boolean isHome(long cx, long cy, long cz) {
+		final Pos3 h = homeKey;
+		return h != null && h.x() == cx && h.y() == cy && h.z() == cz;
+	}
+
 	static void setBlock(long x, long y, long z, byte block) {
-		long cx = x >> SHIFT, cy = y >> SHIFT, cz = z >> SHIFT;
-		long ck = World.key(cx, cy, cz);
-		if (generating && ck != homeKey) {
-			defer(ck, x, y, z, block);
-			return; // Replay cross-chunk feature writes later instead of mutating another chunk now.
-		}
-		int s = world.slot(cx, cy, cz);
-		if (world.keys[s] != ck)
+		final long cx = x >> SHIFT, cy = y >> SHIFT, cz = z >> SHIFT;
+		if (generating && !isHome(cx, cy, cz)) { // replay cross-chunk feature writes later
+			defer(new Pos3(cx, cy, cz), x, y, z, block);
 			return;
+		}
+		final int s = world.slot(cx, cy, cz);
+		if (!world.matches(s, cx, cy, cz)) return;
 		Octree c = world.data[s];
 		final byte prev = c == null ? AIR : c.get((byte) (x & MASK), (byte) (y & MASK), (byte) (z & MASK));
-		if (prev == block) return; // nothing to change: no version bumps, no copy-on-write of shared chunks
+		if (prev == block) return;
 		if (c == null) {
-			if (block == AIR)
-				return;
+			if (block == AIR) return;
 			c = world.data[s] = new Octree(64);
 		} else if (c.shared) {
-			if (c.root == (Octree.LEAF | (block & 0xFF)))
-				return;
+			if (c.root == (Octree.LEAF | (block & 0xFF))) return;
 			c = world.data[s] = c.copy();
 		}
-		if (!c.set((int) (x & MASK), (int) (y & MASK), (int) (z & MASK), block))
-			return;
+		if (!c.set((int) (x & MASK), (int) (y & MASK), (int) (z & MASK), block)) return;
 		if (emits(prev) || emits(block)) lightVer++;
 		world.dirty[s] = true;
-		if (generating) {
-			streamVer++;
-		} else {
-			worldVer++;
-			world.user[s] = true;
-		}
+		if (generating) streamVer++;
+		else { worldVer++; world.user[s] = true; }
 		if (block != AIR && y < userTopY) userTopY = y;
-		if (c.isEmpty())
-			world.data[s] = null;
+		if (c.isEmpty()) world.data[s] = null;
 	}
 
 	private static void fill(byte block, long x0, long y0, long z0, long x1, long y1, long z1, boolean replace) {
@@ -3816,13 +3793,13 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 						byte blk = buf[n++];
 						long dx = ox + a, dy = oy + b, dz = oz + c;
 						if (blk != AIR && inPlayerBlocks(pm, dx, dy, dz)) continue;
-						if (!isLoaded(dx, dy, dz)) continue;
+						if (isLoaded(dx, dy, dz)) continue;
 						byte cur = getBlock(dx, dy, dz);
 						if (cur == blk) continue;
 						if (blk != AIR) need[blk & 0xFF]++;
 						if (cur != AIR) repl[cur & 0xFF]++;
 					}
-			if (!commitInventory(need, repl)) return;
+			if (commitInventory(need, repl)) return;
 		}
 		n = 0;
 		for (long a = 0; a < sx; a++)
@@ -3863,86 +3840,127 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		return 1;
 	}
 
-	private static void explode(long centerX, long centerY, long centerZ, int power) {
+	/** Fixed blast radius (blocks). The slider and the `power` variable are gone. */
+	static final int BLAST_RADIUS = 5;
+	static final double DMG_POINT_BLANK = 1.0, DMG_CLOSE = 3.0; // 3 dmg <= 1 block, 2 dmg <= 3 blocks, then 1 dmg
+	static volatile boolean gpuEnabled = true;
+	static volatile int atlasVer;
+
+	/** Damage at the player from a blast centred on this block: 3/2/1 by distance, minus the blast resistance between the two. */
+	private static int blastDamage(long cx, long cy, long cz) {
+		final double dx = (x.getIntegerPart() - cx) + (x.getFractionalPart() - 0.5);
+		final double dy = (y.getIntegerPart() - cy) + (y.getFractionalPart() + 0.65 - 0.5); // body centre, not the eyes
+		final double dz = (z.getIntegerPart() - cz) + (z.getFractionalPart() - 0.5);
+		final double d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+		if (d > BLAST_RADIUS + 2) return 0;
+		final int base = d <= DMG_POINT_BLANK ? 3 : d <= DMG_CLOSE ? 2 : 1;
+		int shield = 0;
+		long lx = 0, ly = 0, lz = 0; // last voxel visited, relative to the blast block (the blast block itself is skipped)
+		final int steps = (int) Math.ceil(d * 4);
+		for (int i = 1; i < steps; i++) {
+			final double f = i / (double) steps;
+			final long vx = (long) Math.floor(0.5 + dx * f), vy = (long) Math.floor(0.5 + dy * f), vz = (long) Math.floor(0.5 + dz * f);
+			if (vx == lx && vy == ly && vz == lz) continue;
+			lx = vx; ly = vy; lz = vz;
+			shield += explosionResistance(getBlock(cx + vx, cy + vy, cz + vz)); // stone 1, magma/basalt 2, obsidian 3
+		}
+		return Math.max(0, base - shield);
+	}
+
+	private static void explode(long centerX, long centerY, long centerZ) {
 		boom(centerX, centerY, centerZ);
-		if (survival && dist(centerX, centerY, centerZ) <= power + 2) damage(1);
-		final int r2 = power * power;
-		Deque<long[]> stack = new ArrayDeque<>();
+		final int power = BLAST_RADIUS, r2 = power * power;
+		final Deque<long[]> stack = new ArrayDeque<>();
 		stack.push(new long[] { centerX, centerY, centerZ });
-		Set<Long> detonated = new HashSet<>();
+		final Set<Pos3> detonated = new HashSet<>();
+		final long[] loot = survival ? new long[256] : null;
+		int worst = 0;
 		while (!stack.isEmpty()) {
-			long[] c = stack.pop();
-			if (!detonated.add((c[0] * 31 + c[1]) * 31 + c[2])) continue;
+			final long[] c = stack.pop();
+			if (!detonated.add(new Pos3(c[0], c[1], c[2]))) continue;
+			if (survival) worst = Math.max(worst, blastDamage(c[0], c[1], c[2]));
 			for (int dx = -power; dx <= power; dx++) {
-				int remX = r2 - dx * dx;
+				final int remX = r2 - dx * dx;
 				for (int dy = -power; dy <= power; dy++) {
-					int remY = remX - dy * dy;
+					final int remY = remX - dy * dy;
 					if (remY < 0) continue;
-					long bx = c[0] + dx, by = c[1] + dy;
-					long zLo = c[2] - (int) Math.sqrt(remY), zHi = c[2] + (int) Math.sqrt(remY);
-					for (long bz = zLo; bz <= zHi; ) {
-						long segEnd = Math.min(zHi, bz | MASK);
-						Octree ch = world.chunk(bx >> SHIFT, by >> SHIFT, bz >> SHIFT);
+					final long bx = c[0] + dx, by = c[1] + dy;
+					final long zLo = c[2] - (int) Math.sqrt(remY), zHi = c[2] + (int) Math.sqrt(remY);
+					for (long bz = zLo; bz <= zHi;) {
+						final long segEnd = Math.min(zHi, bz | MASK);
+						final Octree ch = world.chunk(bx >> SHIFT, by >> SHIFT, bz >> SHIFT);
 						if (ch == null || ch == World.UNLOADED) { bz = segEnd + 1; continue; }
 						for (; bz <= segEnd; bz++) {
-							int f = ch.find((int) (bx & MASK), (int) (by & MASK), (int) (bz & MASK));
-							if (f >= 0 && (f & 0xFF) == AIR) { // uniform air cube: jump to its far edge
-								bz = Math.min(segEnd, bz | ((1L << (f >> 8)) - 1));
-								continue;
-							}
-							byte block = f >= 0 ? (byte) f : ch.get((byte) (bx & MASK), (byte) (by & MASK), (byte) (bz & MASK));
+							final int f = ch.find((int) (bx & MASK), (int) (by & MASK), (int) (bz & MASK));
+							if (f >= 0 && (f & 0xFF) == AIR) { bz = Math.min(segEnd, bz | ((1L << (f >> 8)) - 1)); continue; }
+							final byte block = f >= 0 ? (byte) f : ch.get((byte) (bx & MASK), (byte) (by & MASK), (byte) (bz & MASK));
 							if (block == AIR) continue;
-							// Remaining blast energy falls off with distance; resistance 0 is always vulnerable.
-							double energy = power - Math.sqrt(dx * dx + dy * dy + (bz - c[2]) * (double) (bz - c[2]));
+							final double energy = power - Math.sqrt(dx * dx + dy * dy + (bz - c[2]) * (double) (bz - c[2]));
 							if (energy <= explosionResistance(block)) continue;
 							setBlock(bx, by, bz, AIR);
 							Particles.debris(bx, by, bz, block, c[0], c[1], c[2]);
 							if (block == DYNAMITE) stack.push(new long[] { bx, by, bz });
+							else if (loot != null) loot[block & 0xFF]++;
 						}
 					}
 				}
 			}
 		}
+		if (worst > 0) damage(worst);
+		if (loot != null) collectLoot(loot);
 	}
 
-	/** Mode 1 = only into air (leaves, logs, ice, gems), mode 2 = only over leaves (the holes punched in a canopy). */
-	private static void defer(long chunkKey, long x, long y, long z, byte block) {
+	/** Gives the whole haul to the inventory at once; whatever does not fit is lost. */
+	private static void collectLoot(long[] loot) {
+		boolean full = false;
+		for (int id = 1; id < 256; id++)
+			if (loot[id] > 0 && giveBlock((byte) id, (int) Math.min(Integer.MAX_VALUE, loot[id])) > 0) full = true;
+		if (full) say("Inventory full");
+	}
+
+	/** Mode 1 = only into air, mode 2 = only over leaves. Duplicates are harmless (replays are idempotent), so no set is needed. */
+	private static void defer(Pos3 chunk, long x, long y, long z, byte block) {
 		if (pendingCount > PENDING_MAX) trimPending();
-		long idx = (x & MASK) | ((y & MASK) << SHIFT) | ((z & MASK) << 2 * SHIFT);
-		long mode = block == AIR ? 2 : 1;
-		long entry = idx | (mode << 18) | ((long) (block & 0xFF) << 20);
-		if (pendingWrites.computeIfAbsent(chunkKey, k -> new LinkedHashSet<>()).add(entry))
-			pendingCount++;
+		final long idx = (x & MASK) | ((y & MASK) << SHIFT) | ((z & MASK) << 2 * SHIFT);
+		final long mode = block == AIR ? 2 : 1;
+		pendingWrites.computeIfAbsent(chunk, _ -> new LongList()).add(idx | (mode << 18) | ((long) (block & 0xFF) << 20));
+		pendingCount++;
 	}
 
-	/** Replays feature writes that earlier chunks made into this freshly generated one. Main thread only. */
 	static void applyPending(long cx, long cy, long cz) {
-		long key = World.key(cx, cy, cz);
-		Set<Long> ops = pendingWrites.get(key);
-		if (ops == null)
-			return;
-		boolean g = generating;
-		long h = homeKey;
+		final Pos3 key = new Pos3(cx, cy, cz);
+		final LongList ops = pendingWrites.remove(key);
+		if (ops == null) return;
+		pendingCount = Math.max(0, pendingCount - ops.size());
+		final boolean g = generating;
+		final Pos3 h = homeKey;
 		generating = true;
 		homeKey = key; // so these writes aren't recorded again
 		try {
-			for (long e : ops) {
-				int idx = (int) (e & 0x3FFFF), mode = (int) ((e >> 18) & 3);
-				byte blk = (byte) (e >> 20);
-				long x = cx * SIZE + (idx & MASK), y = cy * SIZE + ((idx >> SHIFT) & MASK), z = cz * SIZE + ((idx >> 2 * SHIFT) & MASK);
-				byte cur = getBlock(x, y, z);
-				if (mode == 1 ? cur == AIR : isLeaves(cur))
-					setBlock(x, y, z, blk);
+			for (int i = 0, n = ops.size(); i < n; i++) {
+				final long e = ops.get(i);
+				final int idx = (int) (e & 0x3FFFF), mode = (int) ((e >> 18) & 3);
+				final byte blk = (byte) (e >> 20);
+				final long x = cx * SIZE + (idx & MASK), y = cy * SIZE + ((idx >> SHIFT) & MASK), z = cz * SIZE + ((idx >> 2 * SHIFT) & MASK);
+				final byte cur = getBlock(x, y, z);
+				if (mode == 1 ? cur == AIR : isLeaves(cur)) setBlock(x, y, z, blk);
 			}
 		} finally {
 			generating = g;
 			homeKey = h;
-			if (pendingWrites.remove(key) != null) pendingCount = Math.max(0, pendingCount - ops.size());
-			if (ops != null) {
-			    Octree oc = world.chunk(cx, cy, cz);
-			    if (oc != null && oc != World.UNLOADED && !oc.shared) oc.compact();
-			}
+			final Octree oc = world.chunk(cx, cy, cz);
+			if (oc != null && oc != World.UNLOADED && !oc.shared) oc.compact();
 		}
+	}
+
+	static void trimPending() {
+		var it = pendingWrites.entrySet().iterator();
+		while (it.hasNext() && pendingCount > PENDING_MAX * 3 / 4) { pendingCount -= it.next().getValue().size(); it.remove(); }
+	}
+
+	static void dropPending(Pos3 key) {
+		final LongList s = pendingWrites.remove(key);
+		if (s != null) pendingCount -= s.size();
 	}
 
 	private static void click(int button) {
@@ -3984,10 +4002,8 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		if (button == 3 && has && emptyHand) {
 			if (Activator.onEmptyHandUse(hx, hy, hz)) return;
 			byte b = getBlock(hx, hy, hz);
-			if (b == DYNAMITE)
-				explode(hx, hy, hz, power);
-			else if (b == EMERALD && !survival)
-				buildTree(hx, hy + 1, hz, 5, new Random());
+			if (b == DYNAMITE) explode(hx, hy, hz);
+			else if (b == EMERALD && !survival) buildTree(hx, hy + 1, hz, 5, new Random());
 		}
 	}
 
@@ -4582,7 +4598,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 			}
 		} else if (option == 2 && controlsUIEnabled) {
 			g2d.setColor(Color.white);
-			ln(g2d, "Bitwise Nexus " + VERSION + ", made on October 30, 2026");
+			ln(g2d, "Bitwise Nexus " + VERSION + ", made on November 25, 2026");
 			g2d.setColor(Color.red);
 			ln(g2d, "Interface controls: F1 to hide all, F3 toggles HUD, F4 toggles controls HUD");
 			g2d.setColor(Color.yellow);
@@ -4706,7 +4722,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 					int c = Integer.parseInt(t, 16);
 					rgb[0] = c >> 16 & 255; rgb[1] = c >> 8 & 255; rgb[2] = c & 255;
 					panel.repaint();
-				} catch (NumberFormatException ignored) {}
+				} catch (NumberFormatException _) {}
 			}
 		});
 
@@ -4812,7 +4828,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
         }
 	}
 
-	private static Path sharedWorldsPath() { return Paths.get(SHARED_WORLDS_DIR).toAbsolutePath(); }
+	private static Path sharedWorldsPath() { return Path.of(SHARED_WORLDS_DIR).toAbsolutePath(); }
 
 	private static volatile List<File> worldListCache = Collections.emptyList();
 	private static volatile long worldListStamp;
@@ -4854,24 +4870,17 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 			byte[] hdr = new byte[116];
 			in.readFully(hdr);
 			s = hdr[115] != 0;
-		} catch (IOException ignored) {}
+		} catch (IOException _) {}
 		worldModeCache.put(f.getPath(), new long[] { lm, s ? 1 : 0 });
 		return s;
-	}
-
-	private static boolean validNexusFile(File file) {
-		String n = file.getName().toLowerCase(Locale.ROOT);
-		if (file == null || !file.isFile() || !(n.endsWith(".nexus") || n.endsWith(".nexus.bak"))) return false;
-		try (DataInputStream in = new DataInputStream(new BufferedInputStream(Files.newInputStream(file.toPath())))) { int m = in.readInt(); return m == MAGIC || m == MAGIC_V8; }
-		catch (IOException ex) { return false; }
 	}
 
 	private static int frontGuiScale() {
 		// Honor the same GUI scale as the in-game HUD, but step down when needed
 		// so bottom-anchored controls (especially Back) remain inside the window.
-		int requested = Math.max(1, Math.min(3, scale));
-		int fit = Math.max(1, Math.min(width / 640, height / 480));
-		return Math.max(1, Math.min(requested, fit));
+		int requested = Math.clamp(scale, 1, 3);
+		int fit = Math.clamp(Math.min(width / 640, height / 480), 1, Integer.MAX_VALUE);
+		return Math.clamp(requested, 1, fit);
 	}
 
 	private static final SimpleDateFormat WORLD_DATE_FMT = new SimpleDateFormat("MMM'.' d, yyyy 'at' H:mm:ss", Locale.ENGLISH);
@@ -5024,24 +5033,13 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 
 	private File deleteConfirmWorld = null;
 
-    private static boolean deleteWorldFiles(File world) {
-        if (world == null || !world.exists()) return false;
-
-        try {
-            if (world.isDirectory()) {
-                File[] children = world.listFiles();
-                if (children == null) return false;
-
-                for (File child : children) {
-                    if (!deleteWorldFiles(child)) return false;
-                }
-            }
-
-            return world.delete();
-        } catch (SecurityException e) {
-            return false;
-        }
-    }
+	private static boolean deleteWorldFiles(File world) {
+		if (world == null || !world.exists()) return false;
+		try (var walk = Files.walk(world.toPath())) {
+			for (Path p : (Iterable<Path>) walk.sorted(Comparator.reverseOrder())::iterator) Files.delete(p);
+			return true;
+		} catch (IOException _) { return false; }
+	}
 
     private void frontMenuClick(int mx, int my) {
 		int gui = frontGuiScale();
@@ -5070,11 +5068,12 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		        deleteConfirmWorld = null;
 
 		        if (target.exists() && deleteWorldFiles(target)) {
-		            try { Files.deleteIfExists(backupOf(target)); } catch (IOException ignored) {}
+		            try { Files.deleteIfExists(backupOf(target)); } catch (IOException _) {}
 		            invalidateWorldList();
 		            List<File> remaining = discoverSharedWorlds();
 		            worldSelection = remaining.isEmpty() ? -1 : Math.min(worldSelection, remaining.size() - 1);
-		            worldScroll = Math.min(worldScroll, Math.max(0, remaining.size() - 1));
+					worldScroll = Math.clamp(worldScroll, 0, remaining.size() - 1);
+					worldModeCache.remove(target.getPath());
 		            frontMessage = "World deleted.";
 		        } else {
 		            frontMessage = "Could not delete world.";
@@ -5229,145 +5228,8 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		tasks.add(()->doLoad(f)); frontMessage="Loading "+f.getName()+"…";
 	}
 
-	private static double createUiScale() {
-	    double requested = Math.max(1, Math.min(3, scale));
-	    return Math.min(requested, Math.max(0.5, (height - 24.0) / CREATE_H));
-	}
-
-	/** {x0, w, top} in menu space. */
-	private static int[] createGeom() {
-	    double s = createUiScale();
-	    int w = Math.max(240, Math.min(420, (int) (width / s) - 24));
-	    return new int[] { (width - w) / 2, w, height / 2 - CREATE_H / 2 };
-	}
-
-	private void drawCreateWorld(Graphics2D g0) {
-	    Graphics2D g = (Graphics2D) g0.create();
-	    g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
-	    double s = createUiScale();
-	    g.translate(width / 2.0, height / 2.0); g.scale(s, s); g.translate(-width / 2.0, -height / 2.0);
-	    int[] gm = createGeom(); int x0 = gm[0], w = gm[1], T = gm[2];
-	    String name = createWorldName;
-	    g.setColor(Color.WHITE); g.setFont(pal(Font.BOLD, 22)); centered(g, "Create World", width / 2, T + 18);
-
-	    int fy = T + 30, fh = 36;
-	    g.setColor(new Color(78, 78, 78, 230)); g.fillRoundRect(x0, fy, w, fh, 8, 8);
-	    g.setFont(pal(Font.PLAIN, 16)); FontMetrics fm = g.getFontMetrics();
-	    int ty = fy + (fh + fm.getAscent() - fm.getDescent()) / 2, innerW = w - 20, textLeft = x0 + 10;
-	    int caretIdx = Math.max(0, Math.min(name.length(), createNameCaret));
-	    int caretPx = fm.stringWidth(name.substring(0, caretIdx));
-	    createNameScroll = Math.max(0, Math.min(createNameScroll, caretPx));
-	    if (caretPx - createNameScroll > innerW) createNameScroll = caretPx - innerW;
-	    createNameScroll = Math.min(createNameScroll, Math.max(0, fm.stringWidth(name) - innerW));
-	    int tx = textLeft - createNameScroll;
-	    Graphics2D fg = (Graphics2D) g.create();
-	    fg.clipRect(textLeft, fy, innerW + 1, fh);
-	    int a = Math.max(0, Math.min(name.length(), Math.min(createNameCaret, createNameAnchor)));
-	    int b = Math.max(0, Math.min(name.length(), Math.max(createNameCaret, createNameAnchor)));
-	    if (b > a) {
-	        int sx = tx + fm.stringWidth(name.substring(0, a)), ex = tx + fm.stringWidth(name.substring(0, b));
-	        fg.setColor(new Color(125, 125, 125, 220)); fg.fillRect(sx, fy + 4, ex - sx, fh - 8);
-	    }
-	    fg.setColor(Color.WHITE); fg.drawString(name, tx, ty);
-	    if (System.currentTimeMillis() % 1000 < 550) fg.drawLine(tx + caretPx, fy + 6, tx + caretPx, fy + fh - 6);
-	    fg.dispose();
-
-	    g.setColor(new Color(225, 225, 225)); g.setFont(pal(Font.PLAIN, 12));
-	    g.drawString("Name: letters, numbers, _ and - (max 32)", x0, T + 82);
-	    drawButton(g, new Rectangle(x0, T + 90, w, 32), "Gamemode: " + (createSurvival ? "Survival" : "Creative"));
-
-	    g.setFont(pal(Font.BOLD, 15));
-	    drawWorldSettings(g, x0, w, T + 120);
-	    int by = T + 320, half = (w - 8) / 2;
-	    drawButton(g, new Rectangle(x0, by, half, 36), "Cancel");
-	    drawButton(g, new Rectangle(x0 + half + 8, by, half, 36), "Create");
-	    g.dispose();
-	}
-
-	private static void drawExtraSettings(Graphics2D g, int x0, int w, int e) {
-	    int halfW = (w - 10) / 2;
-	    drawButton(g,new Rectangle(x0,e,halfW,28),"Classic Mode: "+(classic?"ON":"OFF"));
-	    drawButton(g,new Rectangle(x0+halfW+10,e,halfW,28),"Bitwise Mode: "+(xor?"ON":"OFF"));
-	    drawButton(g,new Rectangle(x0,e+32,halfW,28),"Freeze Time: "+(freezeTime?"ON":"OFF"));
-	    drawButton(g,new Rectangle(x0+halfW+10,e+32,halfW,28),"Lantern: "+(lanternEnabled?"ON":"OFF"));
-	    drawSlider(g,x0,e+80,w,"AO Strength",AO_STRENGTH,String.format(Locale.ROOT,"%.2f%s",AO_STRENGTH,AO_STRENGTH==0?" (Off)":""));
-	    drawSlider(g,x0,e+130,w,"Explosion Power",(power-1)/126.0,Integer.toString(power),survival);
-	    g.setColor(Color.WHITE); g.drawString("Fog Color (RGB 0-1)",x0,e+186);
-	    double[] rgb = {Math.max(0,Math.min(1,red)),Math.max(0,Math.min(1,green)),Math.max(0,Math.min(1,blue))};
-	    String[] labels = {"R","G","B"};
-	    for (int i=0;i<3;i++) {
-	        int bx=x0+i*(w/3), bw=w/3-8;
-	        g.setColor(new Color(55,55,60)); g.fillRoundRect(bx,e+194,bw,28,6,6);
-	        g.setColor(Color.WHITE); g.drawString(labels[i]+": "+String.format(Locale.ROOT,"%.3f",rgb[i])+(rgbEditChannel==i?"  > "+rgbEdit:""),bx+8,e+213);
-	    }
-	    int fogColor=(int)(rgb[0]*255)<<16|(int)(rgb[1]*255)<<8|(int)(rgb[2]*255);
-	    g.setColor(new Color(fogColor)); g.fillRoundRect(x0,e+228,64,26,6,6);
-	    drawButton(g,new Rectangle(x0+72,e+226,110,30),"Hex: #"+(rgbEditChannel==-2?rgbEdit:String.format(Locale.ROOT,"%06X",fogColor)));
-	    drawButton(g,new Rectangle(x0+190,e+226,w-190,30),"Modify Fog Color");
-	}
-
-	private boolean extraSettingsClick(int mx, int my, int x0, int w, int e) {
-	    int halfW = (w - 10) / 2;
-	    if (my>=e && my<=e+28) { if (mx<x0+halfW+5) classic=!classic; else toggleXor(); }
-	    else if (my>=e+32 && my<=e+60) { if (mx<x0+halfW+5) freezeTime=!freezeTime; else lanternEnabled=!lanternEnabled; }
-	    else if (my>=e+98 && my<=e+122) AO_STRENGTH=Math.round(Math.max(0,Math.min(1,(mx-x0)/(double)w))*100)/100.0;
-	    else if (my>=e+148 && my<=e+172) { if (!survival) power=(byte)(1+Math.round(Math.max(0,Math.min(1,(mx-x0)/(double)w))*126)); }
-	    else if (my>=e+194 && my<=e+222) { rgbEditChannel=Math.max(0,Math.min(2,(mx-x0)/(w/3))); rgbEdit=""; }
-	    else if (my>=e+226 && my<=e+256) {
-	        if (mx>=x0+72 && mx<x0+182) { rgbEditChannel=-2; rgbEdit=""; }
-	        else if (mx>=x0+190) {
-	            Color c=pickFogColor(new Color((float)red,(float)green,(float)blue));
-	            if (c!=null) { red=c.getRed()/255.0; green=c.getGreen()/255.0; blue=c.getBlue()/255.0; }
-	        }
-	    } else return false;
-	    return true;
-	}
-
-	static final int CREATE_H = 370;
 	static final double[] AMPS = { 1, 10, 100 };
 	static final String[] AMP_NAMES = { "Normal Amp.", "High Amp.", "Ultra Amp." };
-
-	private static void drawWorldSettings(Graphics2D g, int x0, int w, int y0) {
-	    drawButton(g,new Rectangle(x0,y0+18,w,32),"Cave Generation: "+(caves?"ON":"OFF"));
-	    drawButton(g,new Rectangle(x0,y0+56,w,32),"3D Terrain: "+(terrain3D?"ON":"OFF"));
-	    int bw = w / 3;
-	    for (int i = 0; i < 3; i++)
-	        drawButton(g,new Rectangle(x0+i*bw,y0+118,bw-8,30),AMP_NAMES[i],amp==AMPS[i]?3f:1f); // thick border = selected
-	    int fy = y0 + 154;
-	    g.setColor(new Color(45,47,54)); g.fillRoundRect(x0,fy,w,26,6,6);
-	    g.setColor(ampEditFocused ? new Color(120,190,255) : new Color(90,93,104));
-	    g.drawRoundRect(x0,fy,w,26,6,6);
-	    String av = ampEdit == null ? "" : ampEdit;
-	    FontMetrics fm = g.getFontMetrics();
-	    g.setColor(new Color(220,224,232)); g.drawString("Amp:",x0+8,fy+17);
-	    int tx = x0 + 52;
-	    if (ampEditFocused) {
-            int aa=Math.max(0,Math.min(av.length(),Math.min(ampCaret,ampAnchor)));
-            int ab=Math.max(0,Math.min(av.length(),Math.max(ampCaret,ampAnchor)));
-            if(aa<ab){int sx=tx+fm.stringWidth(av.substring(0,aa)), ex=tx+fm.stringWidth(av.substring(0,ab));g.setColor(new Color(75,112,165));g.fillRect(sx,fy+4,Math.max(1,ex-sx),18);}
-        }
-	    g.setColor(Color.WHITE); g.drawString(av,tx,fy+17);
-	    if (ampEditFocused && System.currentTimeMillis()%1000<550) {
-	        int ci=Math.max(0,Math.min(av.length(),ampCaret));
-	        int cx=tx+fm.stringWidth(av.substring(0,ci));
-	        g.drawLine(cx,fy+4,cx,fy+22);
-	    }
-	}
-
-	private boolean worldSettingsClick(int mx, int my, int x0, int w, int y0) {
-	    if (my>=y0+18 && my<=y0+50) caves = !caves;
-	    else if (my>=y0+56 && my<=y0+88) terrain3D = !terrain3D;
-	    else if (my>=y0+118 && my<=y0+148) { amp = AMPS[Math.max(0,Math.min(2,(mx-x0)/(w/3)))]; ampEdit=Double.toString(amp); ampCaret=ampAnchor=ampEdit.length(); ampEditFocused=false; }
-	    else if (my>=y0+154 && my<=y0+180) {
-	        ampEditFocused=true;
-	        FontMetrics fm=frame.getFontMetrics(pal(Font.PLAIN,15));
-	        int target=Math.max(0,mx-(x0+52)); ampCaret=0;
-	        while(ampCaret<ampEdit.length() && fm.stringWidth(ampEdit.substring(0,ampCaret+1))<target) ampCaret++;
-	        ampAnchor=ampCaret;
-	    }
-	    else return false;
-	    return true;
-	}
 
 	/** Applies the typed amplitude (or restores the last valid one) and unfocuses the field. */
 	private static void commitAmpEdit() {
@@ -5376,41 +5238,11 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 			double v = Double.parseDouble(ampEdit == null ? "" : ampEdit.trim());
 			if (!Double.isFinite(v) || v <= 0) throw new NumberFormatException();
 			amp = v;
-		} catch (NumberFormatException ex) {
+		} catch (NumberFormatException _) {
 			frontMessage = "Amplitude must be a finite positive number.";
 		}
 		ampEdit = Double.toString(amp);
 		ampCaret = ampAnchor = ampEdit.length();
-	}
-
-	private void createWorldClick(int sx, int sy) {
-	    double s = createUiScale();
-	    int mx = (int) Math.round(width / 2.0 + (sx - width / 2.0) / s);
-	    int my = (int) Math.round(height / 2.0 + (sy - height / 2.0) / s);
-	    int[] gm = createGeom(); int x0 = gm[0], w = gm[1], T = gm[2];
-	    if (ampEditFocused && !new Rectangle(x0, T + 120 + 154, w, 26).contains(mx, my)) commitAmpEdit();
-	    if (new Rectangle(x0, T + 30, w, 36).contains(mx, my)) {
-            ampEditFocused=false;
-	        rgbEditChannel = -1; rgbEdit = "";
-	        FontMetrics fm = frame.getFontMetrics(pal(Font.PLAIN, 16));
-	        String name = createWorldName; int target = mx - (x0 + 10) + createNameScroll, c = 0;
-	        while (c < name.length() && fm.stringWidth(name.substring(0, c + 1)) < target) c++;
-	        createNameCaret = createNameAnchor = c;
-	        return;
-	    }
-	    if (new Rectangle(x0, T + 90, w, 32).contains(mx, my)) { ampEditFocused = false; createSurvival = !createSurvival; return; }
-	    if (worldSettingsClick(mx, my, x0, w, T + 120)) return;
-	    int by = T + 320, half = (w - 8) / 2;
-	    if (new Rectangle(x0, T+120+154, w, 26).contains(mx,my)) {
-	        ampEditFocused=true;
-	        FontMetrics fm=frame.getFontMetrics(pal(Font.PLAIN,15));
-	        int target=Math.max(0,mx-(x0+52)); ampCaret=0;
-	        while(ampCaret<ampEdit.length() && fm.stringWidth(ampEdit.substring(0,ampCaret+1))<target) ampCaret++;
-	        ampAnchor=ampCaret;
-	    }
-	    else if (new Rectangle(x0, by, half, 36).contains(mx, my)) { ampEditFocused=false; frontScreen = 1; frontMessage = ""; }
-	    else if (new Rectangle(x0 + half + 8, by, half, 36).contains(mx, my)) { ampEditFocused=false; createWorld(); }
-	    else ampEditFocused=false;
 	}
 
 	private void createWorld() {
@@ -5420,7 +5252,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		velX = velY = velZ = 0;
 		mouseLookArmed = false;
 		String name=createWorldName;
-		if(name==null||!name.matches("[A-Za-z0-9_ -]{1,32}")||name.trim().isEmpty()){worldLoading=false;frontMessage="Use letters, numbers, spaces, _ or - (1–32 chars).";return;}
+		if(name==null||!name.matches("[A-Za-z0-9_ -]{1,32}")||name.isBlank()){worldLoading=false;frontMessage="Use letters, numbers, spaces, _ or - (1–32 chars).";return;}
 		try {
 			Files.createDirectories(sharedWorldsPath()); File target=sharedWorldsPath().resolve(name+".nexus").toFile();
 			if(target.exists()){worldLoading=false;frontMessage="A world with that name already exists.";return;}
@@ -5525,16 +5357,9 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	private static double menuUiScale() {
 		// Scale controls up with the selected/automatic GUI scale, but cap the
 		// effective transform so the tallest page and its Back button stay visible.
-		double requested = Math.max(1, Math.min(3, scale));
+		double requested = Math.clamp(scale, 1, 3);
 		double fit = Math.max(0.75, (height - 24.0) / settingsContentHeight());
 		return Math.min(requested, fit);
-	}
-
-	private static int settingsContentHeight() { return settingsPage == 1 ? 650 : 310; }
-
-	private static int settingsY0() {
-	    int base = (height - settingsContentHeight()) / 2;
-	    return settingsPage == 1 ? base + 40 : Math.max(0, base); // page 1 leaves headroom for the title
 	}
 
 	private static int menuTitleY() {
@@ -5547,97 +5372,29 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	static final double FLIGHT_MIN = 0.01, FLIGHT_MAX = 10, FLIGHT_CURVE = 5; // lower curve = closer to linear
 	static final int DIST_MIN = 128, DIST_MAX = 4096, DIST_STEP = 64;
 
-	/** Slider position 0..1 -> sensitivity (log scale). */
-	static double sensFromT(double t) {
-		return SENS_MIN * Math.pow(SENS_MAX / SENS_MIN, Math.max(0, Math.min(1, t)));
-	}
+	static double sensFromT(double t) { return SENS_MIN * Math.pow(SENS_MAX / SENS_MIN, Math.clamp(t, 0.0, 1.0)); }
 
-	/** Sensitivity -> slider position 0..1 (log scale). */
 	static double tFromSens(double s) {
-		s = Math.max(SENS_MIN, Math.min(SENS_MAX, s));
+		s = Math.clamp(s, SENS_MIN, SENS_MAX);
 		return Math.log(s / SENS_MIN) / Math.log(SENS_MAX / SENS_MIN);
 	}
 
-	/** Slider position 0..1 -> flight speed (mild exponential). */
 	static double flightFromT(double t) {
-		t = Math.max(0, Math.min(1, t));
+		t = Math.clamp(t, 0.0, 1.0);
 		return FLIGHT_MIN + (FLIGHT_MAX - FLIGHT_MIN) * (Math.exp(FLIGHT_CURVE * t) - 1) / (Math.exp(FLIGHT_CURVE) - 1);
 	}
 
-	/** Flight speed -> slider position 0..1. */
 	static double tFromFlight(double f) {
-		f = Math.max(FLIGHT_MIN, Math.min(FLIGHT_MAX, f));
+		f = Math.clamp(f, FLIGHT_MIN, FLIGHT_MAX);
 		double u = (f - FLIGHT_MIN) / (FLIGHT_MAX - FLIGHT_MIN);
 		return Math.log(1 + u * (Math.exp(FLIGHT_CURVE) - 1)) / FLIGHT_CURVE;
 	}
 
-	/** Slider position 0..1 -> render distance, snapped to multiples of 64. */
 	static int distFromT(double t) {
-		t = Math.max(0, Math.min(1, t));
-		int steps = (DIST_MAX - DIST_MIN) / DIST_STEP; // 63
-		return DIST_MIN + (int) Math.round(t * steps) * DIST_STEP;
+		return DIST_MIN + (int) Math.round(Math.clamp(t, 0.0, 1.0) * ((DIST_MAX - DIST_MIN) / DIST_STEP)) * DIST_STEP;
 	}
 
-	/** Render distance -> slider position 0..1. */
-	static double tFromDist(double d) {
-		return (Math.max(DIST_MIN, Math.min(DIST_MAX, d)) - DIST_MIN) / (double) (DIST_MAX - DIST_MIN);
-	}
-
-	private void drawMenu(Graphics2D g) {
-		// Main-menu settings already sit on the standard gray front-menu background.
-		// Keep the dark overlay for the in-game pause/settings menu only.
-		if (!(mainMenu && frontScreen == 3)) {
-			g.setColor(new Color(18, 18, 20, 220));
-			g.fillRect(0, 0, width, height);
-		}
-		g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
-		g.setFont(pal(Font.BOLD, Math.max(28, Math.min(42, width / 24))));
-		g.setColor(Color.WHITE);
-		String title = quitConfirm ? "Save and Quit?" : settingsMenu ? (settingsPage == 1 ? "Extra Settings" : "General Settings") : "Paused!";
-		FontMetrics fm = g.getFontMetrics();
-		g.drawString(title, (width - fm.stringWidth(title)) / 2, menuTitleY());
-		g.setFont(pal(Font.BOLD, Math.max(12, 15)));
-		if (quitConfirm) {
-			drawButton(g, menuRect(1), "Yes");
-			drawButton(g, menuRect(2), "Cancel");
-			return;
-		}
-		if (!settingsMenu) {
-			drawButton(g, menuRect(1), "Return to Game");
-			Rectangle settings = menuRect(2);
-			settings.width = (settings.width - 8) / 2;
-			drawButton(g, settings, "Settings");
-			Rectangle teleport = menuRect(2);
-			teleport.x += teleport.width / 2 + 4;
-			teleport.width = (teleport.width - 8) / 2;
-			drawButton(g, teleport, "Teleport");
-			drawButton(g, menuRect(3), "Save and Quit");
-		} else {
-			int x0 = Math.max(24, width / 2 - 210), w = Math.min(420, width - 48);
-			int y0 = settingsY0();
-			int halfW = (w - 10) / 2;
-			if (settingsPage == 1) {
-				drawSlider(g,x0,y0,w,"Flight Speed",tFromFlight(flight),String.format(Locale.ROOT,"%.3f",flight));
-				drawSlider(g,x0,y0+52,w,"Render Distance",tFromDist(dist),dist+" ("+radius+(radius==1?" chunk":" chunks")+")");
-				drawSlider(g,x0,y0+104,w,"FOV",(fov-FOV_MIN)/(FOV_MAX-FOV_MIN),String.format(Locale.ROOT,"%.2f°",fov));
-				drawSlider(g,x0,y0+156,w,"Block Reach",(reach-2)/48.0,Integer.toString(reach));
-				drawButton(g,new Rectangle(x0,y0+200,w,32),"Use Degrees: "+(degrees?"ON":"OFF"));
-				drawExtraSettings(g, x0, w, y0 + 238);
-				drawButton(g,new Rectangle(x0,y0+508,w,36),"Back to General Settings");
-				return;
-			}
-			double sensClamped=Math.max(SENS_MIN,Math.min(SENS_MAX,sensitivity));
-			double relativeSensitivity=sensClamped*(1800.0/Math.PI);
-			drawSlider(g,x0,y0+18,w,"Mouse Sensitivity",tFromSens(sensClamped),"π / "+Math.round(Math.PI/sensClamped)+" (relative: "+String.format(Locale.ROOT,"%.2f",relativeSensitivity)+")");
-			drawSlider(g,x0,y0+66,halfW,"Sound Volume",soundVolume/2.0,Math.round(soundVolume*100)+"%");
-			drawSlider(g,x0+halfW+10,y0+66,halfW,"Music Volume",musicVolume/2.0,Math.round(musicVolume*100)+"%");
-			drawButton(g,new Rectangle(x0,y0+108,halfW,30),"Sounds: "+(sound?"ON":"OFF"));
-			drawButton(g,new Rectangle(x0+halfW+10,y0+108,halfW,30),"Music: "+(musicEnabled?"ON":"OFF"));
-			drawButton(g,new Rectangle(x0,y0+150,w,30),"GUI Scale: "+Math.max(1,Math.min(3,scale)));
-			drawButton(g,new Rectangle(x0,y0+202,w,48),"Extra Settings  >");
-			drawButton(g,new Rectangle(x0,y0+260,w,36),"Apply & Close");
-		}
-	}
+	static double tFromDist(double d) { return (Math.clamp(d, DIST_MIN, DIST_MAX) - DIST_MIN) / (double) (DIST_MAX - DIST_MIN); }
 
 	private static void drawButton(Graphics2D g, Rectangle r, String text) { drawButton(g, r, text, 1); }
 
@@ -5663,87 +5420,6 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		g.setColor(disabled ? new Color(150,150,154) : Color.WHITE); g.fillOval(px-6,sy-4,16,16);
 	}
 
-	private void menuClick(int mx,int my) {
-		// Convert screen coordinates into the menu graphics coordinate system.
-		double guiScale = menuUiScale();
-		mx = (int)Math.round(width / 2.0 + (mx - width / 2.0) / guiScale);
-		my = (int)Math.round(height / 2.0 + (my - height / 2.0) / guiScale);
-		if (quitConfirm) {
-			if (menuRect(1).contains(mx,my)) { tasks.add(this::returnToMainMenu); }
-			else if (menuRect(2).contains(mx,my)) quitConfirm=false;
-			repaint(); return;
-		}
-		if (!settingsMenu) {
-			if (menuRect(1).contains(mx, my)) {
-				paused = false;
-				settingsMenu = false;
-				lock = true;
-				mouseLookArmed = false;
-				frame.setCursor(hidden);
-				center();
-			} else {
-				Rectangle settings = menuRect(2);
-				Rectangle teleport = menuRect(2);
-				settings.width = (settings.width - 8) / 2;
-				teleport.x += teleport.width / 2 + 4;
-				teleport.width = (teleport.width - 8) / 2;
-				if (settings.contains(mx, my)) {
-					settingsMenu = true;
-					settingsPage = 0;
-				} else if (teleport.contains(mx, my)) {
-					openModifyDialog();
-				} else if (menuRect(3).contains(mx, my)) {
-					quitConfirm = true;
-				}
-			}
-		} else {
-			int x0=Math.max(24,width/2-210), w=Math.min(420,width-48), y0=settingsY0();
-			int halfW=(w-10)/2;
-			if(settingsPage==1) {
-				if(my>=y0+18&&my<=y0+42) flight=flightFromT((mx-x0)/(double)w);
-				else if(my>=y0+70&&my<=y0+94) requestDist(distFromT((mx-x0)/(double)w));
-				else if(my>=y0+110&&my<=y0+134) setFov(FOV_MIN+(FOV_MAX-FOV_MIN)*Math.max(0,Math.min(1,(mx-x0)/(double)w)));
-				else if(my>=y0+166&&my<=y0+190) reach=(byte)(2+Math.round(Math.max(0,Math.min(1,(mx-x0)/(double)w))*48));
-				else if(my>=y0+200&&my<=y0+232) degrees=!degrees;
-				else if(my>=y0+508&&my<=y0+544){ if(rgbEditChannel!=-1)applyRgbEdit(); settingsPage=0; }
-				else extraSettingsClick(mx,my,x0,w,y0+238);
-			} else {
-				if(my>=y0+18&&my<=y0+42) sensitivity=sensFromT((mx-x0)/(double)w);
-				else if(my>=y0+66&&my<=y0+90) {if(mx<x0+halfW) soundVolume=2*Math.max(0,Math.min(1,(mx-x0)/(double)halfW));else musicVolume=2*Math.max(0,Math.min(1,(mx-(x0+halfW+10))/(double)halfW));}
-				else if(my>=y0+108&&my<=y0+138) {if(mx<x0+halfW) sound=!sound;else musicEnabled=!musicEnabled;}
-				else if(my>=y0+150&&my<=y0+180) scale=(byte)(Math.max(1,Math.min(3,scale))%3+1);
-				else if(my>=y0+202&&my<=y0+250) settingsPage=1;
-				else if(my>=y0+260&&my<=y0+296) {if(rgbEditChannel>=0)applyRgbEdit();settingsMenu=false;settingsPage=0;}
-			}
-		}
-		repaint();
-	}
-
-	private void menuSliderDrag(int mx, int my) {
-		final boolean create = mainMenu && frontScreen == 2;
-		if ((!paused && !(mainMenu && frontScreen==3)) || (!settingsMenu && !(mainMenu && frontScreen==3)) || menuSliderTarget < 0) return;
-		{ double s = mainMenu && frontScreen == 3 ? menuUiScale() : (paused ? Math.max(1, scale) : 1.0); mx = (int)Math.round(width / 2.0 + (mx - width / 2.0) / s); my = (int)Math.round(height / 2.0 + (my - height / 2.0) / s); }
-		int x0=Math.max(24,width/2-210), w=Math.min(420,width-48);
-		if (create) { int[] gm = createGeom(); x0 = gm[0]; w = gm[1]; } else { x0 = Math.max(24,width/2-210); w = Math.min(420,width-48); }
-		if (menuSliderTarget == 5) { reach=(byte)(2+Math.round(Math.max(0,Math.min(1,(mx-x0)/(double)w))*48));
-		} else if (menuSliderTarget == 6) { setFov(FOV_MIN+(FOV_MAX-FOV_MIN)*Math.max(0,Math.min(1,(mx-x0)/(double)w)));
-		} else if (menuSliderTarget == 7) { if (!survival) power=(byte)(1+Math.round(Math.max(0,Math.min(1,(mx-x0)/(double)w))*126));
-		} else if (menuSliderTarget == 8) { AO_STRENGTH=Math.round(Math.max(0,Math.min(1,(mx-x0)/(double)w))*100)/100.0;
-		} else if (menuSliderTarget == 0) {
-			flight=flightFromT((mx-x0)/(double)w);
-		} else if (menuSliderTarget == 1) {
-			requestDist(distFromT((mx-x0)/(double)w));
-		} else if (menuSliderTarget == 2) {
-			sensitivity=sensFromT((mx-x0)/(double)w);
-		} else if (menuSliderTarget == 3 || menuSliderTarget == 4) {
-			int halfW=(w-10)/2;
-			double t = menuSliderTarget == 3 ? (mx-x0)/(double)halfW : (mx-(x0+halfW+10))/(double)halfW;
-			t=Math.max(0,Math.min(1,t));
-			if(menuSliderTarget==3) soundVolume=2*t; else musicVolume=2*t;
-		} else return;
-		repaint();
-	}
-
 	private void applyRgbEdit() {
 		try {
 			if (rgbEditChannel == -2) {
@@ -5757,6 +5433,392 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 			}
 		} catch(Exception ignored) {}
 		rgbEditChannel=-1; rgbEdit="";
+	}
+
+	private static int settingsContentHeight() { return settingsHeight(settingsPage) + (settingsPage == 1 ? 100 : 14); }
+
+	private static int settingsY0() {
+		final int base = (height - settingsHeight(settingsPage)) / 2;
+		return settingsPage == 1 ? Math.max(40, base) : Math.max(0, base); // page 1 leaves headroom for the title
+	}
+
+	private static double createUiScale() {
+		final double requested = Math.clamp(scale, 1, 3);
+		return Math.min(requested, Math.max(0.5, (height - 24.0) / createHeight()));
+	}
+
+	/** {x0, w, top} in menu space. */
+	private static int[] createGeom() {
+		final double s = createUiScale();
+		final int w = Math.max(240, Math.min(420, (int) (width / s) - 24));
+		return new int[] { (width - w) / 2, w, height / 2 - createHeight() / 2 };
+	}
+
+	private void drawCreateWorld(Graphics2D g0) {
+		final Graphics2D g = (Graphics2D) g0.create();
+		g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+		final double s = createUiScale();
+		g.translate(width / 2.0, height / 2.0); g.scale(s, s); g.translate(-width / 2.0, -height / 2.0);
+		final Lay L = createLayout();
+		g.setColor(Color.WHITE); g.setFont(pal(Font.BOLD, 22));
+		centered(g, "Create World", width / 2, createGeom()[2] + 18);
+		drawWidgets(g, L);
+		drawNameField(g, L.rect(Wid.NAME));
+		drawAmpField(g, L.rect(Wid.AMP_FIELD));
+		g.dispose();
+	}
+
+	private static void drawNameField(Graphics2D g, Rectangle R) {
+		final String name = createWorldName;
+		g.setColor(new Color(78, 78, 78, 230)); g.fillRoundRect(R.x, R.y, R.width, R.height, 8, 8);
+		g.setFont(pal(Font.PLAIN, 16));
+		final FontMetrics fm = g.getFontMetrics();
+		final int ty = R.y + (R.height + fm.getAscent() - fm.getDescent()) / 2, innerW = R.width - 20, textLeft = R.x + 10;
+		final int caretIdx = Math.clamp(createNameCaret, 0, name.length());
+		final int caretPx = fm.stringWidth(name.substring(0, caretIdx));
+		createNameScroll = Math.max(0, Math.min(createNameScroll, caretPx));
+		if (caretPx - createNameScroll > innerW) createNameScroll = caretPx - innerW;
+		createNameScroll = Math.min(createNameScroll, Math.max(0, fm.stringWidth(name) - innerW));
+		final int tx = textLeft - createNameScroll;
+		final Graphics2D fg = (Graphics2D) g.create();
+		fg.clipRect(textLeft, R.y, innerW + 1, R.height);
+		final int a = Math.clamp(Math.min(createNameCaret, createNameAnchor), 0, name.length());
+		final int b = Math.clamp(Math.max(createNameCaret, createNameAnchor), 0, name.length());
+		if (b > a) {
+			final int sx = tx + fm.stringWidth(name.substring(0, a)), ex = tx + fm.stringWidth(name.substring(0, b));
+			fg.setColor(new Color(125, 125, 125, 220)); fg.fillRect(sx, R.y + 4, ex - sx, R.height - 8);
+		}
+		fg.setColor(Color.WHITE); fg.drawString(name, tx, ty);
+		if (System.currentTimeMillis() % 1000 < 550) fg.drawLine(tx + caretPx, R.y + 6, tx + caretPx, R.y + R.height - 6);
+		fg.dispose();
+	}
+
+	private static void drawAmpField(Graphics2D g, Rectangle R) {
+		g.setColor(new Color(45, 47, 54)); g.fillRoundRect(R.x, R.y, R.width, R.height, 6, 6);
+		g.setColor(ampEditFocused ? new Color(120, 190, 255) : new Color(90, 93, 104));
+		g.drawRoundRect(R.x, R.y, R.width, R.height, 6, 6);
+		g.setFont(pal(Font.PLAIN, 15));
+		final FontMetrics fm = g.getFontMetrics();
+		final String av = ampEdit == null ? "" : ampEdit;
+		final int base = R.y + (R.height + fm.getAscent() - fm.getDescent()) / 2, tx = R.x + 52;
+		g.setColor(new Color(220, 224, 232)); g.drawString("Amp:", R.x + 8, base);
+		if (ampEditFocused) {
+			final int aa = Math.clamp(Math.min(ampCaret, ampAnchor), 0, av.length()), ab = Math.clamp(Math.max(ampCaret, ampAnchor), 0, av.length());
+			if (aa < ab) {
+				final int sx = tx + fm.stringWidth(av.substring(0, aa)), ex = tx + fm.stringWidth(av.substring(0, ab));
+				g.setColor(new Color(75, 112, 165)); g.fillRect(sx, R.y + 4, Math.max(1, ex - sx), R.height - 8);
+			}
+		}
+		g.setColor(Color.WHITE); g.drawString(av, tx, base);
+		if (ampEditFocused && System.currentTimeMillis() % 1000 < 550) {
+			final int cx = tx + fm.stringWidth(av.substring(0, Math.clamp(ampCaret, 0, av.length())));
+			g.drawLine(cx, R.y + 4, cx, R.y + R.height - 4);
+		}
+	}
+
+	private static int caretFromX(String text, Font f, int px) {
+		final FontMetrics fm = frame.getFontMetrics(f);
+		int c = 0;
+		while (c < text.length() && fm.stringWidth(text.substring(0, c + 1)) < px) c++;
+		return c;
+	}
+
+	private void createWorldClick(int sx, int sy) {
+		final Point m = toMenu(sx, sy, createUiScale());
+		final Widget k = createLayout().hit(m.x, m.y);
+		final Wid id = k == null ? null : k.id();
+		if (ampEditFocused && id != Wid.AMP_FIELD) commitAmpEdit(); // leaving the field applies it
+		if (id == null) return;
+		switch (id) {
+			case NAME -> {
+				rgbEditChannel = -1; rgbEdit = "";
+				createNameCaret = createNameAnchor = caretFromX(createWorldName, pal(Font.PLAIN, 16), m.x - (k.r().x + 10) + createNameScroll);
+			}
+			case GAMEMODE -> createSurvival = !createSurvival;
+			case CAVES -> caves = !caves;
+			case TERRAIN -> terrain3D = !terrain3D;
+			case AMP_NORMAL, AMP_HIGH, AMP_ULTRA -> {
+				amp = AMPS[id.ordinal() - Wid.AMP_NORMAL.ordinal()];
+				ampEdit = Double.toString(amp); ampCaret = ampAnchor = ampEdit.length(); ampEditFocused = false;
+			}
+			case AMP_FIELD -> {
+				ampEditFocused = true;
+				ampCaret = ampAnchor = caretFromX(ampEdit, pal(Font.PLAIN, 15), Math.max(0, m.x - (k.r().x + 52)));
+			}
+			case CANCEL -> { frontScreen = 1; frontMessage = ""; }
+			case CREATE -> createWorld();
+			default -> { }
+		}
+	}
+
+	private void drawMenu(Graphics2D g) {
+		if (!(mainMenu && frontScreen == 3)) { g.setColor(new Color(18, 18, 20, 220)); g.fillRect(0, 0, width, height); }
+		g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+		g.setFont(pal(Font.BOLD, Math.max(28, Math.min(42, width / 24))));
+		g.setColor(Color.WHITE);
+		final String title = quitConfirm ? "Save and Quit?" : settingsMenu ? (settingsPage == 1 ? "Extra Settings" : "General Settings") : "Paused!";
+		g.drawString(title, (width - g.getFontMetrics().stringWidth(title)) / 2, menuTitleY());
+		g.setFont(pal(Font.BOLD, 15));
+		if (quitConfirm) { drawButton(g, menuRect(1), "Yes"); drawButton(g, menuRect(2), "Cancel"); return; }
+		if (settingsMenu) { drawWidgets(g, settingsLayout()); return; }
+		drawButton(g, menuRect(1), "Return to Game");
+		final Rectangle settings = menuRect(2), teleport = menuRect(2);
+		settings.width = (settings.width - 8) / 2;
+		teleport.x += teleport.width / 2 + 4;
+		teleport.width = (teleport.width - 8) / 2;
+		drawButton(g, settings, "Settings");
+		drawButton(g, teleport, "Teleport");
+		drawButton(g, menuRect(3), "Save and Quit");
+	}
+
+	private void menuClick(int mx, int my) {
+		final Point m = toMenu(mx, my, menuUiScale());
+		mx = m.x; my = m.y;
+		if (quitConfirm) {
+			if (menuRect(1).contains(mx, my)) tasks.add(this::returnToMainMenu);
+			else if (menuRect(2).contains(mx, my)) quitConfirm = false;
+			repaint(); return;
+		}
+		if (settingsMenu) { settingsClick(mx, my); repaint(); return; }
+		if (menuRect(1).contains(mx, my)) {
+			paused = false; settingsMenu = false; lock = true; mouseLookArmed = false;
+			frame.setCursor(hidden); center();
+		} else {
+			final Rectangle settings = menuRect(2), teleport = menuRect(2);
+			settings.width = (settings.width - 8) / 2;
+			teleport.x += teleport.width / 2 + 4;
+			teleport.width = (teleport.width - 8) / 2;
+			if (settings.contains(mx, my)) { settingsMenu = true; settingsPage = 0; }
+			else if (teleport.contains(mx, my)) openModifyDialog();
+			else if (menuRect(3).contains(mx, my)) quitConfirm = true;
+		}
+		repaint();
+	}
+
+	private void menuSliderDrag(int sx, int sy) {
+		final boolean front = mainMenu && frontScreen == 3;
+		if (menuSliderTarget < 0 || !(front || (paused && settingsMenu))) return;
+		final Wid id = WIDS[menuSliderTarget];
+		final Rectangle r = settingsLayout().rect(id);
+		if (r == null) return;
+		applySlider(id, sliderT(r, toMenu(sx, sy, menuUiScale()).x));
+		repaint();
+	}
+
+	// ======================= UI LAYOUT: single source of truth =======================
+	enum Wid { SENS, SOUND_VOL, MUSIC_VOL, SOUND, MUSIC, GUI_SCALE, EXTRA, APPLY,
+		FLIGHT, DIST, FOV, REACH, DEGREES, CLASSIC, BITWISE, FREEZE, LANTERN, AO,
+		FOG_LABEL, FOG_R, FOG_G, FOG_B, FOG_SWATCH, FOG_HEX, FOG_PICK, BACK,           // FOG_R/G/B must stay consecutive
+		NAME, HINT, GAMEMODE, CAVES, TERRAIN, AMP_NORMAL, AMP_HIGH, AMP_ULTRA, AMP_FIELD, CANCEL, CREATE } // AMP_* must stay consecutive
+	enum WKind { BUTTON, SLIDER, LABEL, HINT, FIELD, SWATCH, CUSTOM }
+	static final Wid[] WIDS = Wid.values();
+
+	/** r == null until Lay.row places it. fixedW == 0 means "share the remaining width". */
+	record Widget(Wid id, WKind kind, Rectangle r, String text, String value, double t, int arg, boolean disabled, float border, int fixedW) {
+		Widget at(Rectangle rect) { return new Widget(id, kind, rect, text, value, t, arg, disabled, border, fixedW); }
+	}
+
+	private static Widget btn(Wid id, String text) { return btn(id, text, 1f); }
+	private static Widget btn(Wid id, String text, float border) { return new Widget(id, WKind.BUTTON, null, text, "", 0, 0, false, border, 0); }
+	private static Widget sld(Wid id, String label, double t, String value) { return new Widget(id, WKind.SLIDER, null, label, value, t, 0, false, 1f, 0); }
+	private static Widget lbl(Wid id, String text) { return new Widget(id, WKind.LABEL, null, text, "", 0, 0, false, 1f, 0); }
+	private static Widget hint(Wid id, String text) { return new Widget(id, WKind.HINT, null, text, "", 0, 0, false, 1f, 0); }
+	private static Widget fld(Wid id, String text) { return new Widget(id, WKind.FIELD, null, text, "", 0, 0, false, 1f, 0); }
+	private static Widget custom(Wid id) { return new Widget(id, WKind.CUSTOM, null, "", "", 0, 0, false, 1f, 0); }
+	private static Widget swatch(Wid id, int rgb, int w) { return new Widget(id, WKind.SWATCH, null, "", "", 0, rgb, false, 1f, w); }
+	private static Widget fixed(Widget k, int w) { return new Widget(k.id(), k.kind(), null, k.text(), k.value(), k.t(), k.arg(), k.disabled(), k.border(), w); }
+
+	/** Vertical stack. Every widget's rectangle comes from here and nowhere else. */
+	private static final class Lay {
+		static final int GAP = 8;
+		final List<Widget> ws = new ArrayList<>();
+		final int x0, w, top;
+		int y;
+		Lay(int x0, int w, int top) { this.x0 = x0; this.w = w; this.top = top; this.y = top; }
+
+		Lay gap(int px) { y += px; return this; }
+
+		/** One row of widgets sharing the width equally (fixed-width ones take their own width first). */
+		Lay row(int h, Widget... cols) {
+			int fixedSum = 0, flex = 0;
+			for (Widget c : cols) { if (c.fixedW() > 0) fixedSum += c.fixedW(); else flex++; }
+			final int avail = w - GAP * (cols.length - 1) - fixedSum, fw = flex > 0 ? avail / flex : 0;
+			int x = x0;
+			for (Widget c : cols) {
+				final int cw = c.fixedW() > 0 ? c.fixedW() : fw;
+				ws.add(c.at(new Rectangle(x, y, cw, h)));
+				x += cw + GAP;
+			}
+			y += h + GAP;
+			return this;
+		}
+
+		int height() { return Math.max(0, y - GAP - top); }
+
+		Rectangle rect(Wid id) { for (Widget k : ws) if (k.id() == id) return k.r(); return null; }
+
+		Widget hit(int mx, int my) {
+			for (Widget k : ws) if (k.kind() != WKind.LABEL && k.kind() != WKind.HINT && k.r().contains(mx, my)) return k;
+			return null;
+		}
+	}
+
+	static final int SLD_H = 40;
+	private static final int[] SETTINGS_H = new int[2];
+
+	/** The one place where the settings pages are defined. Change a height or reorder a line and everything follows. */
+	private static Lay buildSettings(int page, int x0, int w, int top) {
+		final Lay L = new Lay(x0, w, top);
+		if (page == 1) {
+			L.row(SLD_H, sld(Wid.FLIGHT, "Flight Speed", tFromFlight(flight), "%.3f".formatted(flight)));
+			L.row(SLD_H, sld(Wid.DIST, "Render Distance", tFromDist(dist), dist + " (" + radius + (radius == 1 ? " chunk" : " chunks") + ")"));
+			L.row(SLD_H, sld(Wid.FOV, "FOV", (fov - FOV_MIN) / (FOV_MAX - FOV_MIN), "%.2f°".formatted(fov)));
+			L.row(SLD_H, sld(Wid.REACH, "Block Reach", (reach - 2) / 48.0, Integer.toString(reach)));
+			L.row(32, btn(Wid.DEGREES, "Use Degrees: " + (degrees ? "ON" : "OFF")));
+			L.gap(6);
+			L.row(28, btn(Wid.CLASSIC, "Classic Mode: " + (classic ? "ON" : "OFF")), btn(Wid.BITWISE, "Bitwise Mode: " + (xor ? "ON" : "OFF")));
+			L.row(28, btn(Wid.FREEZE, "Freeze Time: " + (freezeTime ? "ON" : "OFF")), btn(Wid.LANTERN, "Lantern: " + (lanternEnabled ? "ON" : "OFF")));
+			L.row(SLD_H, sld(Wid.AO, "AO Strength", AO_STRENGTH, "%.2f%s".formatted(AO_STRENGTH, AO_STRENGTH == 0 ? " (Off)" : "")));
+			L.row(16, lbl(Wid.FOG_LABEL, "Fog Color (RGB 0-1)"));
+			final double[] rgb = { Math.clamp(red, 0.0, 1.0), Math.clamp(green, 0.0, 1.0), Math.clamp(blue, 0.0, 1.0) };
+			final String[] n = { "R", "G", "B" };
+			final Widget[] f = new Widget[3];
+			for (int i = 0; i < 3; i++)
+				f[i] = fld(WIDS[Wid.FOG_R.ordinal() + i], n[i] + ": " + "%.3f".formatted(rgb[i]) + (rgbEditChannel == i ? "  > " + rgbEdit : ""));
+			L.row(28, f);
+			final int fogColor = (int) (rgb[0] * 255) << 16 | (int) (rgb[1] * 255) << 8 | (int) (rgb[2] * 255);
+			L.row(30, swatch(Wid.FOG_SWATCH, fogColor, 64),
+					fixed(btn(Wid.FOG_HEX, "Hex: #" + (rgbEditChannel == -2 ? rgbEdit : "%06X".formatted(fogColor))), 110),
+					btn(Wid.FOG_PICK, "Modify Fog Color"));
+			L.gap(6);
+			L.row(36, btn(Wid.BACK, "Back to General Settings"));
+		} else {
+			final double sens = Math.clamp(sensitivity, SENS_MIN, SENS_MAX);
+			L.gap(18);
+			L.row(SLD_H, sld(Wid.SENS, "Mouse Sensitivity", tFromSens(sens),
+					"π / " + Math.round(Math.PI / sens) + " (relative: " + "%.2f".formatted(sens * (1800.0 / Math.PI)) + ")"));
+			L.row(SLD_H, sld(Wid.SOUND_VOL, "Sound Volume", soundVolume / 2.0, Math.round(soundVolume * 100) + "%"),
+					sld(Wid.MUSIC_VOL, "Music Volume", musicVolume / 2.0, Math.round(musicVolume * 100) + "%"));
+			L.row(30, btn(Wid.SOUND, "Sounds: " + (sound ? "ON" : "OFF")), btn(Wid.MUSIC, "Music: " + (musicEnabled ? "ON" : "OFF")));
+			L.row(30, btn(Wid.GUI_SCALE, "GUI Scale: " + Math.clamp(scale, 1, 3)));
+			L.gap(4);
+			L.row(48, btn(Wid.EXTRA, "Extra Settings  >"));
+			L.row(36, btn(Wid.APPLY, "Apply & Close"));
+		}
+		return L;
+	}
+
+	/** Create World screen. Starts below the title. */
+	private static Lay buildCreate(int x0, int w, int top) {
+		final Lay L = new Lay(x0, w, top);
+		L.row(36, custom(Wid.NAME));
+		L.row(14, hint(Wid.HINT, "Name: letters, numbers, _ and - (max 32)"));
+		L.row(32, btn(Wid.GAMEMODE, "Gamemode: " + (createSurvival ? "Survival" : "Creative")));
+		L.row(32, btn(Wid.CAVES, "Cave Generation: " + (caves ? "ON" : "OFF")));
+		L.row(32, btn(Wid.TERRAIN, "3D Terrain: " + (terrain3D ? "ON" : "OFF")));
+		L.gap(6);
+		final Widget[] a = new Widget[3];
+		for (int i = 0; i < 3; i++) a[i] = btn(WIDS[Wid.AMP_NORMAL.ordinal() + i], AMP_NAMES[i], amp == AMPS[i] ? 3f : 1f); // thick border = selected
+		L.row(30, a);
+		L.row(26, custom(Wid.AMP_FIELD));
+		L.gap(10);
+		L.row(36, btn(Wid.CANCEL, "Cancel"), btn(Wid.CREATE, "Create"));
+		return L;
+	}
+
+	private static final int CREATE_TITLE_ROOM = 30, CREATE_PAD = 12;
+	private static int createHeight() { return buildCreate(0, 100, 0).height() + CREATE_TITLE_ROOM + CREATE_PAD; }
+
+	/** Heights never depend on width or state, so each page is measured once. */
+	private static int settingsHeight(int page) {
+		final int p = page == 1 ? 1 : 0;
+		if (SETTINGS_H[p] == 0) SETTINGS_H[p] = buildSettings(p, 0, 100, 0).height();
+		return SETTINGS_H[p];
+	}
+
+	private static Lay settingsLayout() {
+		return buildSettings(settingsPage, Math.max(24, width / 2 - 210), Math.min(420, width - 48), settingsY0());
+	}
+
+	private static Lay createLayout() {
+		final int[] g = createGeom();
+		return buildCreate(g[0], g[1], g[2] + CREATE_TITLE_ROOM);
+	}
+
+	private static Point toMenu(int sx, int sy, double s) {
+		return new Point((int) Math.round(width / 2.0 + (sx - width / 2.0) / s), (int) Math.round(height / 2.0 + (sy - height / 2.0) / s));
+	}
+
+	private static double sliderT(Rectangle r, int mx) { return Math.clamp((mx - r.x) / (double) r.width, 0.0, 1.0); }
+
+	/** Every slider's effect, in one switch. t is 0..1. */
+	private static void applySlider(Wid id, double t) {
+		switch (id) {
+			case SENS -> sensitivity = sensFromT(t);
+			case SOUND_VOL -> soundVolume = 2 * t;
+			case MUSIC_VOL -> musicVolume = 2 * t;
+			case FLIGHT -> flight = flightFromT(t);
+			case DIST -> requestDist(distFromT(t));
+			case FOV -> setFov(FOV_MIN + (FOV_MAX - FOV_MIN) * t);
+			case REACH -> reach = (byte) (2 + Math.round(t * 48));
+			case AO -> AO_STRENGTH = Math.round(t * 100) / 100.0;
+			default -> { }
+		}
+	}
+
+	/** Every settings button's effect, in one switch. */
+	private void settingsAction(Wid id) {
+		switch (id) {
+			case SOUND -> sound = !sound;
+			case MUSIC -> musicEnabled = !musicEnabled;
+			case GUI_SCALE -> scale = (byte) (Math.clamp(scale, 1, 3) % 3 + 1);
+			case EXTRA -> settingsPage = 1;
+			case APPLY -> { if (rgbEditChannel >= 0) applyRgbEdit(); settingsMenu = false; settingsPage = 0; }
+			case DEGREES -> degrees = !degrees;
+			case CLASSIC -> classic = !classic;
+			case BITWISE -> toggleXor();
+			case FREEZE -> freezeTime = !freezeTime;
+			case LANTERN -> lanternEnabled = !lanternEnabled;
+			case FOG_R, FOG_G, FOG_B -> { rgbEditChannel = id.ordinal() - Wid.FOG_R.ordinal(); rgbEdit = ""; }
+			case FOG_HEX -> { rgbEditChannel = -2; rgbEdit = ""; }
+			case FOG_PICK -> {
+				final Color c = pickFogColor(new Color((float) red, (float) green, (float) blue));
+				if (c != null) { red = c.getRed() / 255.0; green = c.getGreen() / 255.0; blue = c.getBlue() / 255.0; }
+			}
+			case BACK -> { if (rgbEditChannel != -1) applyRgbEdit(); settingsPage = 0; }
+			default -> { }
+		}
+	}
+
+	private void settingsClick(int mx, int my) {
+		final Widget k = settingsLayout().hit(mx, my);
+		if (k == null) return;
+		if (k.kind() == WKind.SLIDER) {
+			menuSliderTarget = k.id().ordinal(); // dragging continues in menuSliderDrag
+			applySlider(k.id(), sliderT(k.r(), mx));
+		} else settingsAction(k.id());
+	}
+
+	/** Draws any layout generically. CUSTOM widgets are drawn by their owner using Lay.rect(). */
+	private static void drawWidgets(Graphics2D g, Lay L) {
+		g.setFont(pal(Font.BOLD, 15));
+		for (Widget k : L.ws) {
+			final Rectangle r = k.r();
+			switch (k.kind()) {
+				case BUTTON -> drawButton(g, r, k.text(), k.border());
+				case SLIDER -> drawSlider(g, r.x, r.y + 10, r.width, k.text(), k.t(), k.value(), k.disabled());
+				case LABEL -> { g.setColor(Color.WHITE); g.setFont(pal(Font.BOLD, 15)); g.drawString(k.text(), r.x, r.y + 12); }
+				case HINT -> { g.setColor(new Color(225, 225, 225)); g.setFont(pal(Font.PLAIN, 12)); g.drawString(k.text(), r.x, r.y + 11); }
+				case FIELD -> {
+					g.setColor(new Color(55, 55, 60)); g.fillRoundRect(r.x, r.y, r.width, r.height, 6, 6);
+					g.setColor(Color.WHITE); g.setFont(pal(Font.BOLD, 15));
+					final FontMetrics fm = g.getFontMetrics();
+					g.drawString(k.text(), r.x + 8, r.y + (r.height + fm.getAscent() - fm.getDescent()) / 2);
+				}
+				case SWATCH -> { g.setColor(new Color(k.arg())); g.fillRoundRect(r.x, r.y, r.width, r.height, 6, 6); }
+				case CUSTOM -> { }
+			}
+		}
 	}
 
 	/** Main thread only. */
@@ -5807,21 +5869,20 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	    }
 	}
 
-	private static Map<Long, Object> changedChunkSnapshot() {
-		Map<Long, Object> chunks = new TreeMap<>();
-		for (Map.Entry<Long, Object> e : savedChunks.entrySet())
-			chunks.put(e.getKey(), e.getValue() instanceof Octree ? ((Octree) e.getValue()).frozen() : e.getValue());
-		for (int slot = 0; slot < world.keys.length; slot++) {
-			long key = world.keys[slot];
-			if (key != World.NONE && world.user[slot])
-				chunks.put(key, world.data[slot] == null ? EMPTY : world.data[slot].frozen());
-		}
+	private static Map<Pos3, Cold> changedChunkSnapshot() {
+		final Map<Pos3, Cold> chunks = new HashMap<>(Math.max(16, savedChunks.size() * 2));
+		savedChunks.forEach((k, v) -> chunks.put(k, v instanceof Octree o ? o.frozen() : v));
+		for (int s = 0; s < world.present.length; s++)
+			if (world.present[s] && world.user[s]) {
+				final Octree d = world.data[s];
+				chunks.put(world.keyAt(s), d == null ? Raw.EMPTY : d.frozen());
+			}
 		return chunks;
 	}
 
 	private static final class SaveSnapshot {
 		final File file;
-		final Map<Long, Object> chunks;
+		final Map<Pos3, Cold> chunks;
 		final long pxi, pyi, pzi, sxi, syi, szi;
 		final double pxf, pyf, pzf, sxf, syf, szf, pyaw, ppitch, amplitude, fr, fg, fb;
 		final short renderDistance;
@@ -5829,7 +5890,8 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		final boolean worldCaves, worldTerrain3D, worldClassic, worldXor, flight;
 		final boolean sSurvival; final double sFlightSpeed; final int sHealth; final byte[][] sInvId; final int[][] sInvCount;
 		final int sBonusHealth, sHasteLevel;
-		SaveSnapshot(File file, Map<Long, Object> chunks) {
+		final long[] tele;
+		SaveSnapshot(File file, Map<Pos3, Cold> chunks) {
 			this.file = file; this.chunks = chunks;
 			pxi = x.getIntegerPart(); pxf = x.getFractionalPart();
 			pyi = y.getIntegerPart(); pyf = y.getFractionalPart();
@@ -5843,6 +5905,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 			sSurvival = Nexus.survival; sFlightSpeed = Nexus.flight; sHealth = Nexus.health;
 			sInvId = copyIds(Nexus.invId); sInvCount = copyCounts(Nexus.invCount);
 			sBonusHealth = Activator.bonusHealth; sHasteLevel = Activator.hasteLevel;
+			tele = Activator.snapshotTeleporters();
 		}
 	}
 
@@ -5890,8 +5953,8 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	/** Removes leftover half-written saves. Call only while no save is running. */
 	static void deleteStaleTmp() {
 	    try (DirectoryStream<Path> ds = Files.newDirectoryStream(sharedWorldsPath(), "*.nexus.tmp")) {
-	        for (Path p : ds) try { Files.deleteIfExists(p); } catch (IOException ignored) {}
-	    } catch (IOException ignored) {}
+	        for (Path p : ds) try { Files.deleteIfExists(p); } catch (IOException _) {}
+	    } catch (IOException _) {}
 	}
 
 	/** Deletes any .bak whose main world file no longer exists. Call only while no save is running. */
@@ -5900,9 +5963,9 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	        for (Path bak : ds) {
 	            String n = bak.getFileName().toString();
 	            Path main = bak.resolveSibling(n.substring(0, n.length() - 4)); // strip ".bak"
-	            if (!Files.exists(main)) try { Files.deleteIfExists(bak); } catch (IOException ignored) {}
+	            if (!Files.exists(main)) try { Files.deleteIfExists(bak); } catch (IOException _) {}
 	        }
-	    } catch (IOException ignored) {}
+	    } catch (IOException _) {}
 	}
 
 	private static void writeSave(SaveSnapshot s) {
@@ -5926,20 +5989,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 				out.writeInt(s.sBonusHealth); out.writeInt(s.sHasteLevel);
 				for (int p = 0; p < INV_PAGES; p++)
 					for (int i = 0; i < INV_SLOTS; i++) { out.writeByte(s.sInvId[p][i]); out.writeInt(s.sInvCount[p][i]); }
-				out.writeInt(s.chunks.size());
-				Deflater def = new Deflater(Deflater.BEST_SPEED);
-				try {
-					DeflaterOutputStream z = new DeflaterOutputStream(out, def, 1 << 16);
-					DataOutputStream cd = new DataOutputStream(z);
-					for (Map.Entry<Long, Object> e : s.chunks.entrySet()) {
-						byte[] blob = blobOf(e.getValue());
-						cd.writeLong(e.getKey()); cd.writeInt(blob.length); cd.write(blob);
-					}
-					// Optional trailer within the compressed payload stores the actual world spawn.
-					cd.writeInt(0x5350574E); // SPWN
-					cd.writeLong(s.sxi); cd.writeDouble(s.sxf); cd.writeLong(s.syi); cd.writeDouble(s.syf); cd.writeLong(s.szi); cd.writeDouble(s.szf);
-					cd.flush(); z.finish();
-				} finally { def.end(); }
+				writeChunks(out, s);
 			}
 			// Keep a small last-known-good copy before replacing the primary save.
 			// If the primary write is interrupted later, this backup remains recoverable.
@@ -5954,29 +6004,57 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 			e.printStackTrace();
 			SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(frame, "Failed to save world:\n" + e.getMessage()));
 		} finally {
-		    try { Files.deleteIfExists(tmp); } catch (IOException ignored) {}
+		    try { Files.deleteIfExists(tmp); } catch (IOException _) {}
 		}
+	}
+
+	private static void writeChunks(DataOutputStream out, SaveSnapshot s) throws IOException {
+		out.writeInt(s.chunks.size());
+		final Deflater def = new Deflater(Deflater.BEST_SPEED);
+		try {
+			final DeflaterOutputStream z = new DeflaterOutputStream(out, def, 1 << 16);
+			final DataOutputStream cd = new DataOutputStream(z);
+			for (var e : s.chunks.entrySet()) {
+				final byte[] blob = blobOf(e.getValue());
+				final Pos3 k = e.getKey();
+				cd.writeLong(k.x()); cd.writeLong(k.y()); cd.writeLong(k.z());
+				cd.writeInt(blob.length); cd.write(blob);
+			}
+			cd.writeInt(SPWN_TAG);
+			cd.writeLong(s.sxi); cd.writeDouble(s.sxf); cd.writeLong(s.syi); cd.writeDouble(s.syf); cd.writeLong(s.szi); cd.writeDouble(s.szf);
+			Activator.writeTeleporters(cd, s.tele);
+			cd.flush(); z.finish();
+		} finally { def.end(); }
+	}
+
+	private static boolean validNexusFile(File file) {
+		if (file == null || !file.isFile()) return false;
+		final String n = file.getName().toLowerCase(Locale.ROOT);
+		if (!(n.endsWith(".nexus") || n.endsWith(".nexus.bak"))) return false;
+		try (var in = new DataInputStream(new BufferedInputStream(Files.newInputStream(file.toPath())))) {
+			final int m = in.readInt();
+			return m == MAGIC || m == MAGIC_V9 || m == MAGIC_V8;
+		} catch (IOException _) { return false; }
+	}
+
+	private static boolean savedSpawnObstructed(SplitDecimal sx, SplitDecimal sy, SplitDecimal sz) {
+		final Map<Pos3, Octree> decoded = new HashMap<>();
+		for (byte c = 0; c < 12; c++) {
+			final long bx = blockAtPosition(sx, (c & 1) * 0.6 - 0.3);
+			final long by = blockAtPosition(sy, ((c >> 2) - 1) * 0.8 + 0.65);
+			final long bz = blockAtPosition(sz, (c >> 1 & 1) * 0.6 - 0.3);
+			final Pos3 key = new Pos3(bx >> SHIFT, by >> SHIFT, bz >> SHIFT);
+			final Cold saved = savedChunks.get(key);
+			if (saved == null) continue; // unedited terrain was already accounted for by the saved ground height
+			if (!decoded.containsKey(key)) decoded.put(key, restore(saved));
+			final Octree tree = decoded.get(key);
+			if (tree != null && tree.get((byte) (bx & MASK), (byte) (by & MASK), (byte) (bz & MASK)) != AIR) return true;
+		}
+		return false;
 	}
 
 	private static long blockAtPosition(SplitDecimal p, double offset) {
 		return p.getIntegerPart() + (long)Math.floor(p.getFractionalPart() + offset);
-	}
-
-	/** Checks the saved, player-edited voxels at the twelve collision samples around a spawn. */
-	private static boolean savedSpawnObstructed(SplitDecimal sx, SplitDecimal sy, SplitDecimal sz) {
-		Map<Long, Octree> decoded = new HashMap<>();
-		for (byte c=0;c<12;c++) {
-			long bx=blockAtPosition(sx,(c&1)*0.6-0.3);
-			long by=blockAtPosition(sy,((c>>2)-1)*0.8+0.65);
-			long bz=blockAtPosition(sz,(c>>1&1)*0.6-0.3);
-			long key=World.key(bx>>SHIFT,by>>SHIFT,bz>>SHIFT);
-			Object saved=savedChunks.get(key);
-			if(saved==null) continue; // unedited terrain was already accounted for by the saved ground height
-			Octree tree=decoded.get(key);
-			if(!decoded.containsKey(key)){tree=restore(saved);decoded.put(key,tree);}
-			if(tree!=null && tree.get((byte)(bx&MASK),(byte)(by&MASK),(byte)(bz&MASK))!=AIR) return true;
-		}
-		return false;
 	}
 
 	private static void repairSavedSpawnIfBlocked() {
@@ -6006,7 +6084,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	    worldLoadReadyAt = 0L;
 	    velX = velY = velZ = 0;
 	    mouseLookArmed = false;
-	    Exception first = null;
+	    Exception first;
 	    try { loadWorld(file, file); return; }
 	    catch (Exception e) { first = e; System.err.println("World load failed, trying backup: " + e); }
 
@@ -6028,26 +6106,26 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	}
 
 	private static void loadWorld(File source, File save) throws Exception {
-		final int MAX_BLOB = 2 * VOL + 16; // worst case: alternating blocks, 2 bytes each
-		try (DataInputStream in = new DataInputStream(new BufferedInputStream(Files.newInputStream(source.toPath()), 1 << 16))) {
-			int magic = in.readInt();
-			if (magic != MAGIC && magic != MAGIC_V8) {
-				throw new IOException("Not a Nexus save");
-			}
-			SplitDecimal nx, ny, nz;
-			nx = new SplitDecimal(in.readLong(), in.readDouble());
-			ny = new SplitDecimal(in.readLong(), in.readDouble());
-			nz = new SplitDecimal(in.readLong(), in.readDouble());
-			double nYaw = in.readDouble(), nPitch = in.readDouble();
-			short nDist = in.readShort();
-			long nTime = in.readLong();
-			boolean nFly = in.readBoolean(); boolean nCaves = in.readBoolean(), nT3 = in.readBoolean();
-			double nAmp = in.readDouble(), nRed = in.readDouble(), nGreen = in.readDouble(), nBlue = in.readDouble();
-			boolean nClassic = in.readBoolean(), nXor = in.readBoolean();
-			boolean nSurvival = in.readBoolean(); double nFlightSpeed = in.readDouble(); int nHealth = in.readInt();
+		final int MAX_BLOB = 2 * VOL + 16;
+		try (var in = new DataInputStream(new BufferedInputStream(Files.newInputStream(source.toPath()), 1 << 16))) {
+			final int magic = in.readInt();
+			if (magic != MAGIC && magic != MAGIC_V9 && magic != MAGIC_V8) throw new IOException("Not a Nexus save");
+			final SplitDecimal nx = new SplitDecimal(in.readLong(), in.readDouble());
+			final SplitDecimal ny = new SplitDecimal(in.readLong(), in.readDouble());
+			final SplitDecimal nz = new SplitDecimal(in.readLong(), in.readDouble());
+			final double nYaw = in.readDouble(), nPitch = in.readDouble();
+			final short nDist = in.readShort();
+			final long nTime = in.readLong();
+			final boolean nFly = in.readBoolean(), nCaves = in.readBoolean(), nT3 = in.readBoolean();
+			final double nAmp = in.readDouble(), nRed = in.readDouble(), nGreen = in.readDouble(), nBlue = in.readDouble();
+			final boolean nClassic = in.readBoolean(), nXor = in.readBoolean();
+			final boolean nSurvival = in.readBoolean();
+			final double nFlightSpeed = in.readDouble();
+			final int nHealth = in.readInt();
 			int nBonus = 0, nHaste = 0;
-			if (magic == MAGIC) { nBonus = in.readInt(); nHaste = in.readInt(); }
-			byte[][] nInvId = new byte[INV_PAGES][INV_SLOTS]; int[][] nInvCount = new int[INV_PAGES][INV_SLOTS];
+			if (magic != MAGIC_V8) { nBonus = in.readInt(); nHaste = in.readInt(); }
+			final byte[][] nInvId = new byte[INV_PAGES][INV_SLOTS];
+			final int[][] nInvCount = new int[INV_PAGES][INV_SLOTS];
 			for (int p = 0; p < INV_PAGES; p++)
 				for (int i = 0; i < INV_SLOTS; i++) {
 					byte id = in.readByte(); int cnt = in.readInt();
@@ -6055,43 +6133,39 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 					nInvId[p][i] = id; nInvCount[p][i] = Math.min(cnt, STACK_MAX);
 				}
 
-			int count = in.readInt();
-			if (count < 0)
-				throw new IOException("Invalid chunk count: " + count);
-			Map<Long, byte[]> loaded = new HashMap<>();
-			try (DataInputStream cd = new DataInputStream(new InflaterInputStream(in))) {
+			final int count = in.readInt();
+			if (count < 0) throw new IOException("Invalid chunk count: " + count);
+			final boolean legacyKeys = magic != MAGIC;
+			final Map<Pos3, Cold> loaded = new HashMap<>(Math.min(count, 1 << 20) * 2);
+			long[] nTele = EMPTY_LONGS;
+			try (var cd = new DataInputStream(new InflaterInputStream(in))) {
 				for (int i = 0; i < count; i++) {
-					long key = cd.readLong();
-					int len = cd.readInt();
-					if (len < 0 || len > MAX_BLOB)
-						throw new IOException("Invalid chunk length: " + len);
-					byte[] blob = new byte[len];
+					final Pos3 key = legacyKeys ? World.fromLegacy(cd.readLong()) : new Pos3(cd.readLong(), cd.readLong(), cd.readLong());
+					final int len = cd.readInt();
+					if (len < 0 || len > MAX_BLOB) throw new IOException("Invalid chunk length: " + len);
+					final byte[] blob = new byte[len];
 					cd.readFully(blob);
-					loaded.put(key, len == 0 ? EMPTY : blob);
+					loaded.put(key, len == 0 ? Raw.EMPTY : new Raw(blob));
 				}
-				try {
-					if (cd.readInt() == 0x5350574E) {
+				boolean haveSpawn = false;
+				try { // optional trailers
+					if (cd.readInt() == SPWN_TAG) {
 						worldSpawnX.set(new SplitDecimal(cd.readLong(), cd.readDouble()));
 						worldSpawnY.set(new SplitDecimal(cd.readLong(), cd.readDouble()));
 						worldSpawnZ.set(new SplitDecimal(cd.readLong(), cd.readDouble()));
-					} else { worldSpawnX.set(nx); worldSpawnY.set(ny); worldSpawnZ.set(nz); }
-				} catch (EOFException oldFormat) { worldSpawnX.set(nx); worldSpawnY.set(ny); worldSpawnZ.set(nz); }
+						haveSpawn = true;
+						if (cd.readInt() == TELE_TAG) nTele = Activator.readTeleporters(cd);
+					}
+				} catch (EOFException _) { }
+				if (!haveSpawn) { worldSpawnX.set(nx); worldSpawnY.set(ny); worldSpawnZ.set(nz); }
 			}
 
 			x.set(nx); y.set(ny); z.set(nz);
 			prevX.set(x); prevY.set(y); prevZ.set(z);
-			yaw = nYaw;
-			pitch = nPitch;
-			time = nTime;
-			fly = nFly;
-			caves = nCaves;
-			terrain3D = nT3;
-			amp = nAmp;
-			red = nRed;
-			green = nGreen;
-			blue = nBlue;
-			classic = nClassic;
-			xor = nXor;
+			yaw = nYaw; pitch = nPitch; time = nTime; fly = nFly;
+			caves = nCaves; terrain3D = nT3; amp = nAmp;
+			red = nRed; green = nGreen; blue = nBlue;
+			classic = nClassic; xor = nXor;
 			Activator.setUpgrades(nBonus, nHaste);
 			applySurvivalState(nSurvival, nFlightSpeed, nHealth, nInvId, nInvCount);
 			textures();
@@ -6100,11 +6174,11 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 			setDist(nDist);
 			reloadChunks(false);
 			savedChunks.putAll(loaded);
-			for (long k : loaded.keySet())
-				userTopY = Math.min(userTopY, World.unpackY(k) * SIZE);
+			Activator.setTeleporters(nTele);
+			for (Pos3 k : loaded.keySet()) userTopY = Math.min(userTopY, k.y() * SIZE);
 			activeSaveFile = save;
 			persistentStorage = true;
-			if (magic == MAGIC_V8) { requestedSaveFile = save; saveRequested = true; say("Save upgraded to NXS9"); }
+			if (magic != MAGIC) { requestedSaveFile = save; saveRequested = true; say("Save upgraded to NXSA"); }
 			repairSavedSpawnIfBlocked();
 			mainMenu = false;
 			frame.setCursor(hidden);
@@ -6113,7 +6187,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 			lastPersistentSave = System.currentTimeMillis();
 			needGround = false;
 			prevX.set(x); prevY.set(y); prevZ.set(z);
-			if (dead) die(); // saved while dead -> shows the death screen again
+			if (dead) die();
 		}
 	}
 
@@ -6420,34 +6494,16 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 			return;
 		final long px = floorOf(x), pz = floorOf(z);
 		say("Searching for " + LOC_NAMES[t] + "...");
-		Thread th = new Thread(() -> {
+		Thread.ofPlatform().name("nexus-locate").daemon().start(() -> {
 			try {
 				double[] hit = search(t, px, pz);
-				if (hit == null) {
-					say(LOC_NAMES[t] + ": none found nearby");
-				} else {
-					say(String.format("%s at (%.0f, %.0f, %.0f)", LOC_NAMES[t], hit[0], -hit[1] + 0.0, hit[2]));
+				if (hit == null) say(LOC_NAMES[t] + ": none found nearby");
+				else {
+					say("%s at (%.0f, %.0f, %.0f)".formatted(LOC_NAMES[t], hit[0], -hit[1] + 0.0, hit[2]));
 					teleport(hit, t >= 7);
 				}
-			} finally {
-				locBusy.set(false);
-			}
-		}, "nexus-locate");
-		th.setDaemon(true);
-		th.start();
-	}
-
-	static void trimPending() {
-		Iterator<Map.Entry<Long, LinkedHashSet<Long>>> it = pendingWrites.entrySet().iterator();
-		while (it.hasNext() && pendingCount > PENDING_MAX * 3 / 4) {
-			pendingCount -= it.next().getValue().size();
-			it.remove();
-		}
-	}
-
-	static void dropPending(long key) {
-		LinkedHashSet<Long> s = pendingWrites.remove(key);
-		if (s != null) pendingCount -= s.size();
+			} finally { locBusy.set(false); }
+		});
 	}
 
 	/** floor(p) as a block coordinate. */
@@ -6488,7 +6544,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		java.math.BigDecimal whole = v.setScale(0, java.math.RoundingMode.DOWN);
 		long i;
 		try { i = whole.longValueExact(); }
-		catch (ArithmeticException e) { throw new NumberFormatException("coordinate must be below 2^63"); }
+		catch (ArithmeticException _) { throw new NumberFormatException("coordinate must be below 2^63"); }
 		return new SplitDecimal(i, v.subtract(whole).doubleValue());
 	}
 
@@ -6651,42 +6707,20 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		activity = System.currentTimeMillis();
 		mouseButtonsDown++;
 		if (mainMenu) {
-            Point fp=SwingUtilities.convertPoint((Component)e.getSource(),e.getPoint(),this);
-            if(frontScreen==3){double ms=menuUiScale();int ux=(int)Math.round(width/2.0+(fp.x-width/2.0)/ms), uy=(int)Math.round(height/2.0+(fp.y-height/2.0)/ms);int x0=Math.max(24,width/2-210), w=Math.min(420,width-48), y0=settingsY0(), halfW=(w-10)/2;menuSliderTarget=-1;
-                if(settingsPage==0){if(uy>=y0+18&&uy<=y0+42)menuSliderTarget=2;else if(uy>=y0+66&&uy<=y0+90)menuSliderTarget=ux<x0+halfW?3:4;}
-                else if(settingsPage==1){if(uy>=y0+18&&uy<=y0+42)menuSliderTarget=0;else if(uy>=y0+70&&uy<=y0+94)menuSliderTarget=1;else if(uy>=y0+110&&uy<=y0+134)menuSliderTarget=6;else if(uy>=y0+166&&uy<=y0+190)menuSliderTarget=5;else if(uy>=y0+336&&uy<=y0+360)menuSliderTarget=8;else if(!survival&&uy>=y0+386&&uy<=y0+410)menuSliderTarget=7;}
-                menuSliderDragging=menuSliderTarget>=0;
-            }
-            if(frontScreen==2){menuSliderDragging=menuSliderTarget>=0;}
-            frontMenuClick(fp.x,fp.y); return;
-        }
+			final Point fp = SwingUtilities.convertPoint((Component) e.getSource(), e.getPoint(), this);
+			menuSliderTarget = -1;
+			frontMenuClick(fp.x, fp.y);
+			menuSliderDragging = menuSliderTarget >= 0;
+			return;
+		}
 		if (dead) { Point dp = SwingUtilities.convertPoint((Component) e.getSource(), e.getPoint(), this); deathClick(dp.x, dp.y); return; }
 		if (modifyUi) { Point p=SwingUtilities.convertPoint((Component)e.getSource(),e.getPoint(),this); double gs=Math.max(1,scale); int mx=(int)Math.round(width/2.0+(p.x-width/2.0)/gs), my=(int)Math.round(height/2.0+(p.y-height/2.0)/gs); modifyUiClick(mx,my); return; }
 		if (dialogOpen) return;
 		if (paused) {
-			Point p = SwingUtilities.convertPoint((Component) e.getSource(), e.getPoint(), this);
-            int mx = p.x, my = p.y;
-            double gs = Math.max(1, scale);
-            mx = (int) Math.round(width / 2.0 + (mx - width / 2.0) / gs);
-            my = (int) Math.round(height / 2.0 + (my - height / 2.0) / gs);
-            int y0 = settingsY0();
-            menuSliderTarget = -1;
-            if (settingsMenu) {
-                int x0=Math.max(24,width/2-210), w=Math.min(420,width-48);
-                if(settingsPage==1) {
-                    if(my>=y0+18&&my<=y0+42) menuSliderTarget=0;
-                    else if(my>=y0+70&&my<=y0+94) menuSliderTarget=1;
-                    else if(my>=y0+110&&my<=y0+134) menuSliderTarget=6;
-                    else if(my>=y0+166&&my<=y0+190) menuSliderTarget=5;
-                    else if(my>=y0+336&&my<=y0+360)menuSliderTarget=8;
-                    else if(!survival&&my>=y0+386&&my<=y0+410)menuSliderTarget=7;
-                } else {
-                    if(my>=y0+18&&my<=y0+42) menuSliderTarget=2;
-                    else if(my>=y0+66&&my<=y0+90) menuSliderTarget=mx<x0+(w-10)/2?3:4;
-                }
-            }
-            menuSliderDragging = menuSliderTarget >= 0;
+			final Point p = SwingUtilities.convertPoint((Component) e.getSource(), e.getPoint(), this);
+			menuSliderTarget = -1;
 			menuClick(p.x, p.y);
+			menuSliderDragging = menuSliderTarget >= 0;
 			return;
 		}
 		final int b = e.getButton();
@@ -6787,111 +6821,80 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 
 final class World {
 	static final Octree UNLOADED = new Octree(0);
-	static final long NONE = Long.MIN_VALUE;
 	int w;
-	long[] keys;
+	long[] kx, ky, kz, seen;
+	boolean[] present, dirty, user;
 	Octree[] data;
-	boolean[] dirty, user;
-	long[] seen;
 	int epoch;
 
 	World(int radius) { resize(radius); }
 
 	void resize(int radius) {
-		final long[] oldKeys = keys;
-		final Octree[] oldData = data;
-		final boolean[] oldDirty = dirty, oldUser = user;
-		final long[] oldSeen = seen;
-
+		final long[] okx = kx, oky = ky, okz = kz, oseen = seen;
+		final boolean[] op = present, od = dirty, ou = user;
+		final Octree[] odata = data;
 		w = 2 * radius + 1;
-		int n = w * w * w;
-		keys = new long[n];
+		final int n = w * w * w;
+		kx = new long[n]; ky = new long[n]; kz = new long[n]; seen = new long[n];
+		present = new boolean[n]; dirty = new boolean[n]; user = new boolean[n];
 		data = new Octree[n];
-		dirty = new boolean[n];
-		user = new boolean[n];
-		seen = new long[n];
-		Arrays.fill(keys, NONE);
-
-		// Re-seat every surviving chunk under the new ring size. Colliding chunks are dropped;
-		// player edits were already stashed by flushDirty() before this is called, and
-		// out-of-range chunks get unloaded by cleanupOldChunks().
-		if (oldKeys != null) {
-			for (int i = 0; i < oldKeys.length; i++) {
-				if (oldKeys[i] == NONE) continue;
-				long[] c = decodeKey(oldKeys[i]);
-				int s = slot(c[0], c[1], c[2]);
-				if (keys[s] != NONE) continue;
-				keys[s] = oldKeys[i];
-				data[s] = oldData[i];
-				dirty[s] = oldDirty[i];
-				user[s] = oldUser[i];
-				seen[s] = oldSeen[i];
+		// Re-seat survivors under the new ring size; colliding ones are dropped (edits were stashed by flushDirty()).
+		if (op != null)
+			for (int i = 0; i < op.length; i++) {
+				if (!op[i]) continue;
+				final int s = slot(okx[i], oky[i], okz[i]);
+				if (present[s]) continue;
+				kx[s] = okx[i]; ky[s] = oky[i]; kz[s] = okz[i];
+				present[s] = true; data[s] = odata[i]; dirty[s] = od[i]; user[s] = ou[i]; seen[s] = oseen[i];
 			}
-		}
 		worldVer++;
 		streamVer++;
 	}
 
 	void clear() {
 		epoch++;
-		Arrays.fill(keys, NONE);
+		Arrays.fill(present, false);
 		Arrays.fill(data, null);
 		Arrays.fill(dirty, false);
 		Arrays.fill(user, false);
 		worldVer++;
 	}
 
-	static long key(long cx, long cy, long cz) {
+	/** Legacy 21-bit packing. ONLY for Random seeds, so existing worlds keep generating identically. */
+	static long seed(long cx, long cy, long cz) {
 		return (cx & 0x1FFFFF) << 42 | (cy & 0x1FFFFF) << 21 | (cz & 0x1FFFFF);
 	}
 
-	static long[] decodeKey(long key) {
-		long cx = (key >>> 42) & 0x1FFFFF, cy = (key >>> 21) & 0x1FFFFF, cz = key & 0x1FFFFF;
-		if ((cx & 0x100000) != 0) cx |= ~0x1FFFFFL;
-		if ((cy & 0x100000) != 0) cy |= ~0x1FFFFFL;
-		if ((cz & 0x100000) != 0) cz |= ~0x1FFFFFL;
-		return new long[] { cx, cy, cz };
-	}
+	/** Decodes a key from an NXS8/NXS9 save. */
+	static Pos3 fromLegacy(long k) { return new Pos3(k << 1 >> 43, k << 22 >> 43, k << 43 >> 43); }
 
-	static long unpackX(long k) { return (k << 1) >> 43; }
-	static long unpackY(long k) { return (k << 22) >> 43; }
-	static long unpackZ(long k) { return (k << 43) >> 43; }
-
+	/** floorMod on the full long: neighbouring chunks always land in different slots, whatever the magnitude. */
 	int slot(long cx, long cy, long cz) {
-		int ix = (int) cx % w, iy = (int) cy % w, iz = (int) cz % w;
-		if (ix < 0) ix += w;
-		if (iy < 0) iy += w;
-		if (iz < 0) iz += w;
-		return (ix * w + iy) * w + iz;
+		return (Math.floorMod(cx, w) * w + Math.floorMod(cy, w)) * w + Math.floorMod(cz, w);
 	}
 
-	boolean has(long cx, long cy, long cz) { return keys[slot(cx, cy, cz)] == key(cx, cy, cz); }
+	boolean matches(int s, long cx, long cy, long cz) {
+		return present[s] && kx[s] == cx && ky[s] == cy && kz[s] == cz;
+	}
+
+	Pos3 keyAt(int s) { return new Pos3(kx[s], ky[s], kz[s]); }
+
+	boolean has(long cx, long cy, long cz) { return matches(slot(cx, cy, cz), cx, cy, cz); }
 
 	Octree chunk(long cx, long cy, long cz) {
-		int s = slot(cx, cy, cz);
-		return keys[s] == key(cx, cy, cz) ? data[s] : UNLOADED;
+		final int s = slot(cx, cy, cz);
+		return matches(s, cx, cy, cz) ? data[s] : UNLOADED;
 	}
 
 	void put(long cx, long cy, long cz, Octree d) {
-		int s = slot(cx, cy, cz);
-		data[s] = d;
-		dirty[s] = false;
-		user[s] = false;
-		keys[s] = key(cx, cy, cz);
+		final int s = slot(cx, cy, cz);
+		data[s] = d; dirty[s] = false; user[s] = false;
+		kx[s] = cx; ky[s] = cy; kz[s] = cz; present[s] = true;
 		seen[s] = System.currentTimeMillis();
 		streamVer++;
 	}
 
-	void remove(long cx, long cy, long cz) {
-		int s = slot(cx, cy, cz);
-		if (keys[s] == key(cx, cy, cz)) {
-			keys[s] = NONE;
-			data[s] = null;
-			dirty[s] = false;
-			user[s] = false;
-		}
-		streamVer++;
-	}
+	void vacate(int s) { present[s] = false; data[s] = null; dirty[s] = false; user[s] = false; }
 }
 
 final class Render implements Callable<Void> {
@@ -7155,17 +7158,17 @@ final class Render implements Callable<Void> {
 	    int r = (int) ((fr * lr * (1 - ft) + fog.r * ft) * 255.0);
 	    int g = (int) ((fg * lg * (1 - ft) + fog.g * ft) * 255.0);
 	    int b = (int) ((fb * lb * (1 - ft) + fog.b * ft) * 255.0);
-	    r = Math.max(0, Math.min(255, r));
-	    g = Math.max(0, Math.min(255, g));
-	    b = Math.max(0, Math.min(255, b));
+		r = Math.clamp(r, 0, 255);
+		g = Math.clamp(g, 0, 255);
+		b = Math.clamp(b, 0, 255);
 	    return r << 16 | g << 8 | b;
 	}
 
 	private int probe(long bx, long by, long bz) {
 		if (csz > 0
-		        && (bx & ~(csz - 1)) == cox
-		        && (by & ~(csz - 1)) == coy
-		        && (bz & ~(csz - 1)) == coz) {
+		        && (bx & -csz) == cox
+		        && (by & -csz) == coy
+		        && (bz & -csz) == coz) {
 		    return cpk ? (int) ((cval >>> ((int) ((bx & 1) | ((by & 1) << 1) | ((bz & 1) << 2)) << 3)) & 0xFF) : cinfo;
 		}
 		long cx = bx >> SHIFT, cy = by >> SHIFT, cz = bz >> SHIFT;
@@ -7185,7 +7188,7 @@ final class Render implements Callable<Void> {
 			return (int) ((cval >>> ((int) ((bx & 1) | ((by & 1) << 1) | ((bz & 1) << 2)) << 3)) & 0xFF);
 		}
 		cpk = false;
-		long sz = 1L << (info >> 8), m = ~(sz - 1);
+		long sz = 1L << (info >> 8), m = -sz;
 		cox = bx & m; coy = by & m; coz = bz & m;
 		csz = sz;
 		cinfo = info;
@@ -7198,14 +7201,14 @@ final class Render implements Callable<Void> {
 		double sp = sinPitch, cp = cosPitch, sy = sinYaw, cy = cosYaw;
 		double temp = cp + fy * sp;
 		double dyBase = fy * cp - sp;
+		final int centerCol = w / 2, centerRow = h / 2;
+		final boolean centerRowHit = row == centerRow;
 		for (int col = c0; col < c1; col++) {
 			double fx = colX[col];
 			double inv = invLen[base + col];
 			double dx = (fx * cy + temp * sy) * inv;
 			double dy = dyBase * inv;
 			double dz = (temp * cy - fx * sy) * inv;
-			final int centerCol = w / 2, centerRow = h / 2;
-			final boolean centerRowHit = row == centerRow;
 			final boolean center = centerRowHit && col == centerCol;
 			double r, g, b;
 			depth[base + col] = Float.MAX_VALUE;
@@ -7289,7 +7292,7 @@ final class Render implements Callable<Void> {
 				int lg = info >> 8, cid = info & 0xFF;
 				if ((cid != AIR && cid != GLASS) || lg == 0)
 				    break;
-				long S = 1L << lg, M = ~(S - 1);
+				long S = 1L << lg, M = -S;
 				long x0c = bx & M, y0c = by & M, z0c = bz & M;
 				long nx = sx > 0 ? x0c + S - bx : sx < 0 ? bx - x0c + 1 : 0;
 				long ny = sy > 0 ? y0c + S - by : sy < 0 ? by - y0c + 1 : 0;
@@ -7432,7 +7435,7 @@ final class Render implements Callable<Void> {
 				if (!skip || lg == 0)
 				    break;
 				// Air cube of side 2^lg: jump to where the ray leaves it.
-				long S = 1L << lg, M = ~(S - 1);
+				long S = 1L << lg, M = -S;
 				long x0c = bx & M, y0c = by & M, z0c = bz & M;
 				long nx = sx > 0 ? x0c + S - bx : sx < 0 ? bx - x0c + 1 : 0;
 				long ny = sy > 0 ? y0c + S - by : sy < 0 ? by - y0c + 1 : 0;
@@ -7698,10 +7701,7 @@ final class Render implements Callable<Void> {
 	    final double v = axis == 2 ? hy : hz;
 	    final double fu = u - Math.floor(u);
 	    final double fv = v - Math.floor(v);
-
-	    final double sample = Math.max(
-	        0.02, Math.min(1.0, aoAt(fx, fy, fz, axis, fu, fv))
-	    );
+	    final double sample = Math.clamp(aoAt(fx, fy, fz, axis, fu, fv), 0.02, 1.0);
 
 	    return strength == 1.0 ? sample : Math.max(0.02, Math.pow(sample, strength));
 	}
@@ -8052,7 +8052,7 @@ final class Particles {
 	static float[] size = new float[cap];
 	static int[] color = new int[cap], life = new int[cap];
 	static int count, overwrite;
-	static final Random R = new Random();
+	static final RandomGenerator R = RandomGenerator.getDefault();
 	static long oX, oY, oZ;
 	private static final long REBASE = 1L << 20;
 
@@ -8220,7 +8220,7 @@ final class Particles {
 		final double invXS = 1.0 / Render.xScale, invYS = 1.0 / Render.yScale;
 		final double maxK = dist; // beyond the fog distance nothing is visible anyway
 		final double offX = oX - Render.pbx, offY = oY - Render.pby, offZ = oZ - Render.pbz; // origin relative to the camera block
-		final Render lr = !workers.isEmpty() ? workers.get(0) : null;
+		final Render lr = !workers.isEmpty() ? workers.getFirst() : null;
 		if (lr != null) lr.beginParticleLight();
 		for (int i = 0; i < count; i++) {
 			double rx = offX + pX[i] - Render.rpx, ry = offY + pY[i] - Render.rpy, rz = offZ + pZ[i] - Render.rpz;
@@ -8231,8 +8231,8 @@ final class Particles {
 			double scrX = xc / k * invXS + w * 0.5;
 			double scrY = (ry * cp + zc * sp) / k * invYS + h * 0.5;
 			double half = size[i] * Math.min(1.0, life[i] / 20.0) * 0.5 / k;
-			int hx = Math.min(12, Math.max(1, (int) Math.round(half * invXS)));
-			int hy = Math.min(12, Math.max(1, (int) Math.round(half * invYS)));
+			int hx = Math.clamp((int) Math.round(half * invXS), 1, 12);
+			int hy = Math.clamp((int) Math.round(half * invYS), 1, 12);
 			int cx = (int) Math.floor(scrX), cy = (int) Math.floor(scrY);
 			if (cx + hx < 0 || cx - hx >= w || cy + hy < 0 || cy - hy >= h)
 				continue; // off-screen: skip before the sqrt
@@ -8287,11 +8287,10 @@ final class Vec3 {
 		this.z = z;
 	}
 
-	static Vec3 lerp(Vec3 a, Vec3 b, double t, Vec3 out) {
+	static void lerp(Vec3 a, Vec3 b, double t, Vec3 out) {
 		out.x = a.x + (b.x - a.x) * t;
 		out.y = a.y + (b.y - a.y) * t;
 		out.z = a.z + (b.z - a.z) * t;
-		return out;
 	}
 
 	static Vec3 rgb(int rgb) {
@@ -8306,7 +8305,6 @@ final class Fog {
 		{ .03, .04, .06, 2.4 }, { .10, .34, .14, 2.0 }, { .45, .65, .90, 1.6 }, { .17, .06, .28, 2.4 }, { .03, .04, .06, 2.4 }, { .10, .08, .07, 2.8 } };
 	private static final int[] ASC = { CB_MOSS, CB_SNOW, CB_BASALT, CB_OBSIDIAN, CB_CRYSTAL }; // ascending priority
 	private static final int N = 8192;
-	private final long[] keys = new long[N];
 	private final double[] cache = new double[N * 4];
 	private double sr, sg, sb, sd;
 	private final double[] caveBlend = new double[4];
@@ -8316,8 +8314,6 @@ final class Fog {
 	private final long[] biomeX = new long[BIOME_CACHE_SIZE], biomeZ = new long[BIOME_CACHE_SIZE];
 	private final double[] biomeNoise = new double[BIOME_CACHE_SIZE];
 	private final boolean[] biomeUsed = new boolean[BIOME_CACHE_SIZE];
-
-	Fog() { Arrays.fill(keys, World.NONE); }
 
 	/** Cached lattice samples plus bilinear interpolation: smooth across cells, cheap per pixel. */
 	private double biomeSample(long gx, long gz) {
@@ -8346,8 +8342,8 @@ final class Fog {
 		double plain = Math.max(0, 1 - dry - snow - ice);
 		sr = dry * .85 + plain * Nexus.red   + snow * .82 + ice * .55;
 		sg = dry * .72 + plain * Nexus.green + snow * .90 + ice * .82;
-		sb = dry * .48 + plain * Nexus.blue  + snow * .97 + ice * 1.0;
-		sd = dry * 1.0 + plain * 1.0 + snow * 1.3 + ice * 1.7;
+		sb = dry * .48 + plain * Nexus.blue  + snow * .97 + ice;
+		sd = dry + plain + snow * 1.3 + ice * 1.7;
 	}
 
 	private double[] cave(long bx, double ox, long by, double oy, long bz, double oz) {
@@ -8378,12 +8374,14 @@ final class Fog {
 		}
 	}
 
+	private final long[] kx = new long[N], ky = new long[N], kz = new long[N];
+	private final boolean[] used = new boolean[N];
+
 	private int caveVoxel(long x, long y, long z) {
-		long k = World.key(x, y, z);
-		int i = (int) ((k * 0x9E3779B97F4A7C15L) >>> 51); // 13 bits
-		int o = i << 2;
-		if (keys[i] != k) {
-			keys[i] = k;
+		final int i = (int) (Cache.hash(x, y, z, 0xF06L) >>> 51); // 13 bits
+		final int o = i << 2;
+		if (!used[i] || kx[i] != x || ky[i] != y || kz[i] != z) {
+			used[i] = true; kx[i] = x; ky[i] = y; kz[i] = z;
 			System.arraycopy(CAVE[0], 0, cache, o, 4);
 			for (int b : ASC) {
 				double w = Nexus.zone(b, x, y, z);
@@ -8402,7 +8400,7 @@ final class Fog {
 	}
 }
 
-final class Octree {
+final class Octree implements Cold {
 	static final int LEAF = 0x80000000, PACKED = 0xC0000000, PBIT = 0x40000000, PMASK = 0x3FFFFFFF;
 	static final long ONES = 0x0101010101010101L;
 	static final int[] EMPTY_I = new int[0];
@@ -9097,8 +9095,8 @@ final class Activator {
 	static double hasteMultiplier() { return 1.0 + HASTE_PER_LEVEL * hasteLevel; }
 
 	static void setUpgrades(int hearts, int haste) {
-		bonusHealth = Math.max(0, Math.min(MAX_HEART_CLAIMS, hearts));
-		hasteLevel = Math.max(0, Math.min(HASTE_MAX, haste));
+		bonusHealth = Math.clamp(hearts, 0, MAX_HEART_CLAIMS);
+		hasteLevel = Math.clamp(haste, 0, HASTE_MAX);
 	}
 
 	/** Called from breakSeconds(): haste makes the quickest blocks instant. */
@@ -9155,7 +9153,7 @@ final class Activator {
 
 	// ======================= textures =======================
 	private static final String[] HEART = {
-		"................",	
+		"................",
 		"................",
 		"..XXXX....XXXX..",
 		".XXXXXX..XXXXXX.",
@@ -9200,17 +9198,20 @@ final class Activator {
 			double d = Math.hypot(x - 7.5, y - 7.5);
 			if (d > 7.9) return 0;
 			boolean edge = d > 7.2 || (d >= 4.5 && d < 5.3);
-			switch (type) {
-			case REGEN_CRYSTAL:
-				if (d >= 4.5) return edge ? 0xFF9E101F : 0xFFE0283A;
-				return d < 2.8 ? 0xFF63F281 : 0xFF25B842;
-			case MINOR_REGEN_CRYSTAL:
-				if (d >= 4.5) return edge ? 0xFF750E19 : 0xFFB52D3B;
-				return d < 2.8 ? 0xFFBFBFBF : 0xFF7F7F7F;
-			default: // HASTE_CRYSTAL: yellow ring, empty middle
-				if (d < 4.5) return 0;
-				return edge ? 0xFFB88A00 : 0xFFFFD21C;
-			}
+            return switch (type) {
+                case REGEN_CRYSTAL -> {
+                    if (d >= 4.5) yield edge ? 0xFF9E101F : 0xFFE0283A;
+                    yield d < 2.8 ? 0xFF63F281 : 0xFF25B842;
+                }
+                case MINOR_REGEN_CRYSTAL -> {
+                    if (d >= 4.5) yield edge ? 0xFF750E19 : 0xFFB52D3B;
+                    yield d < 2.8 ? 0xFFBFBFBF : 0xFF7F7F7F;
+                }
+                default -> {
+                    if (d < 4.5) yield 0;
+                    yield edge ? 0xFFB88A00 : 0xFFFFD21C;
+                }
+            };
 		}
 		}
 	}
@@ -9225,7 +9226,7 @@ final class Activator {
 		int ax = Math.abs(rx), ay = Math.abs(ry), az = Math.abs(rz);
 		if (ax > 2 || ay > 2 || az > 2) return false;
 		if (ay == 2) return ax <= 1 && az <= 1;
-		return ay <= 1 && ((ax == 2 && az <= 1) || (az == 2 && ax <= 1));
+		return ax == 2 && az <= 1 || az == 2 && ax <= 1;
 	}
 
 	private static byte shellBlock(int ry) { return Math.abs(ry) == 2 ? OAK_LOG : GLASS; }
@@ -9315,13 +9316,13 @@ final class Activator {
 	}
 
 	private static byte oreToBlock(byte ore) {
-		switch (ore) {
-		case COAL_ORE: return COAL;
-		case COPPER_ORE: return COPPER;
-		case IRON_ORE: return IRON;
-		case GOLD_ORE: return GOLD;
-		default: return AIR;
-		}
+        return switch (ore) {
+            case COAL_ORE -> COAL;
+            case COPPER_ORE -> COPPER;
+            case IRON_ORE -> IRON;
+            case GOLD_ORE -> GOLD;
+            default -> AIR;
+        };
 	}
 
 	private static void fillCube(byte[] out, int size, byte v) {
@@ -9409,7 +9410,7 @@ final class Activator {
 	/** Right click on the activator: find the structure, match a recipe, replace the contents with the result. */
 	static boolean craftAt(long ax, long ay, long az) {
 		long[] c = findStructure(ax, ay, az);
-		if (c == null) { say("No crafting structure adjacent to Activator"); return true; }
+		if (c == null) { say("No structure adjacent to Activator"); return true; }
 		byte[] in = readInterior(c[0], c[1], c[2]);
 		if (in == null) { say("Crafting area is not fully loaded"); return true; }
 		Craft r = recipe(in);
@@ -9417,7 +9418,7 @@ final class Activator {
 		if (survival && r.item != AIR) { // all-or-nothing; creative has every item in its hotbar page already
 			long[] add = new long[256];
 			add[r.item & 0xFF] = r.itemCount;
-			if (!commitInventory(new long[256], add)) return true;
+			if (commitInventory(new long[256], add)) return true;
 		}
 		for (int x = 0; x < 3; x++)
 			for (int y = 0; y < 3; y++)
@@ -9429,9 +9430,164 @@ final class Activator {
 		return true;
 	}
 
-	/** Empty-hand right click on a block: activator -> craft, finished cube -> condense. Returns true if handled. */
 	static boolean onEmptyHandUse(long hx, long hy, long hz) {
-		if (getBlock(hx, hy, hz) == ACTIVATOR) return craftAt(hx, hy, hz);
+		if (getBlock(hx, hy, hz) == ACTIVATOR)
+			return handleTeleporter(hx, hy, hz) || craftAt(hx, hy, hz);
 		return condenseAt(hx, hy, hz);
+	}
+
+	// ======================= teleporters =======================
+	/** Registered teleporter, keyed by its activator position. partner == null means it is waiting for a link. */
+	private static final class Link {
+		final Pos3 pos; Pos3 partner;
+		Link(Pos3 pos) { this.pos = pos; }
+	}
+	private static final LinkedHashMap<Pos3, Link> TELEPORTERS = new LinkedHashMap<>(); // insertion order = oldest first
+
+	/** Reads blocks from the live world, or from the saved (player-edited) chunks if the area is unloaded. One decode per chunk. */
+	private static final class Peek {
+		private final HashMap<Pos3, Octree> decoded = new HashMap<>(8);
+		byte at(long bx, long by, long bz) {
+			final long cx = bx >> SHIFT, cy = by >> SHIFT, cz = bz >> SHIFT;
+			Octree o = world.chunk(cx, cy, cz);
+			if (o == World.UNLOADED) {
+				final Pos3 k = new Pos3(cx, cy, cz);
+				o = decoded.get(k);
+				if (o == null && !decoded.containsKey(k)) {
+					final Cold c = savedChunks.get(k);            // never edited => cannot hold a player-built structure
+					o = c == null ? null : restore(c);
+					decoded.put(k, o);
+				}
+			}
+			return o == null ? AIR : o.get((byte) (bx & MASK), (byte) (by & MASK), (byte) (bz & MASK));
+		}
+	}
+
+	/** True if a complete teleporter has its activator at (ax, ay, az). Layer 0 = floor (ay + 1), +y is down. */
+	private static boolean intact(Peek w, long ax, long ay, long az) {
+		if (w.at(ax, ay, az) != ACTIVATOR) return false;
+		final long floor = ay + 1;
+		for (int dx = -2; dx <= 2; dx++)
+			for (int dz = -2; dz <= 2; dz++) {
+				final int ex = Math.abs(dx), ez = Math.abs(dz);
+				final long bx = ax + dx, bz = az + dz;
+				final byte base = w.at(bx, floor, bz), roof = w.at(bx, floor - 3, bz);
+				if (ex == 2 && ez == 2) { // pillar: 4 logs, floor level included
+					if (base != OAK_LOG || roof != OAK_LOG || w.at(bx, floor - 1, bz) != OAK_LOG || w.at(bx, floor - 2, bz) != OAK_LOG) return false;
+				} else if (ex == 2 || ez == 2) { // rim: bricks below, leaves above
+					if (base != BRICKS || !isLeaves(roof)) return false;
+				} else { // 3x3 interior
+					if (roof != GLASS) return false;
+					if (ex == 0 && ez == 0) { if (base != EMERALD) return false; }
+					else if (ex + ez == 1) { if (base != TOPAZ) return false; }
+					else if (base != RHODONITE && base != TANZANITE) return false;
+					if (w.at(bx, floor - 2, bz) != AIR) return false;
+					if ((ex != 0 || ez != 0) && w.at(bx, floor - 1, bz) != AIR) return false; // centre of level 1 is the activator
+				}
+			}
+		return true;
+	}
+
+	/** Right click on an activator. Returns true if it was a teleporter (consumed); false lets crafting handle it. */
+	static synchronized boolean handleTeleporter(long ax, long ay, long az) {
+		final Pos3 here = new Pos3(ax, ay, az);
+		final Peek w = new Peek();
+		Link me = TELEPORTERS.get(here);
+		if (!intact(w, ax, ay, az)) {
+			if (me == null) return false;                       // plain crafting activator
+			unlinkAndForget(me);
+			say("Teleporter damaged - link has been broken");
+			return true;
+		}
+		if (me == null) {                                       // new teleporter: save it and start a link request
+			me = new Link(here);
+			TELEPORTERS.put(here, me);
+			if (!pair(me, w)) say("Teleporter saved - build a second one and activate it to link them");
+			return true;
+		}
+		if (me.partner == null) {
+			if (!pair(me, w)) say("Waiting for a second teleporter to link with");
+			return true;
+		}
+		final Pos3 to = me.partner;
+		final Link other = TELEPORTERS.get(to);
+		if (other == null || !here.equals(other.partner) || !intact(w, to.x(), to.y(), to.z())) {
+			TELEPORTERS.remove(to);                             // the far end is gone: it must be rebuilt and activated again
+			me.partner = null;
+			say("Link has been broken - teleporter at " + posStr(to.x(), to.y(), to.z()) + " is gone. Waiting for a new link");
+			return true;
+		}
+		// Land on a corner tile (rhodonite/tanzanite): topaz would launch the player. Feet = floor - 1.54, exact long math.
+		moveTo(new SplitDecimal(to.x() + 1, 0.5), new SplitDecimal(to.y() + 1, -1.54), new SplitDecimal(to.z() + 1, 0.5), false);
+		fallDist = 0;
+		say("Teleported to " + posStr(to.x(), to.y(), to.z()));
+		return true;
+	}
+
+	/** Links me with the oldest waiting, still-intact teleporter. Stale waiting entries are dropped on the way. */
+	private static boolean pair(Link me, Peek w) {
+		for (var it = TELEPORTERS.values().iterator(); it.hasNext();) {
+			final Link o = it.next();
+			if (o == me || o.partner != null) continue;
+			if (!intact(w, o.pos.x(), o.pos.y(), o.pos.z())) { it.remove(); continue; }
+			me.partner = o.pos;
+			o.partner = me.pos;
+			say("Teleporters linked! Right click the activator to travel");
+			return true;
+		}
+		return false;
+	}
+
+	/** Forgets a destroyed teleporter; its partner (if any) goes back to waiting. */
+	private static void unlinkAndForget(Link dead) {
+		TELEPORTERS.remove(dead.pos);
+		if (dead.partner != null) {
+			final Link p = TELEPORTERS.get(dead.partner);
+			if (p != null && dead.pos.equals(p.partner)) p.partner = null;
+		}
+	}
+
+	// ---- persistence: 7 longs per teleporter {x, y, z, hasPartner, px, py, pz} ----
+	static synchronized long[] snapshotTeleporters() {
+		final long[] out = new long[TELEPORTERS.size() * 7];
+		int i = 0;
+		for (Link l : TELEPORTERS.values()) {
+			final Pos3 p = l.partner;
+			out[i++] = l.pos.x(); out[i++] = l.pos.y(); out[i++] = l.pos.z();
+			out[i++] = p == null ? 0 : 1;
+			out[i++] = p == null ? 0 : p.x(); out[i++] = p == null ? 0 : p.y(); out[i++] = p == null ? 0 : p.z();
+		}
+		return out;
+	}
+
+	static synchronized void setTeleporters(long[] d) {
+		TELEPORTERS.clear();
+		for (int i = 0; i + 6 < d.length; i += 7) {
+			final Pos3 p = new Pos3(d[i], d[i + 1], d[i + 2]);
+			final Link l = new Link(p);
+			if (d[i + 3] != 0) l.partner = new Pos3(d[i + 4], d[i + 5], d[i + 6]);
+			TELEPORTERS.put(p, l);
+		}
+		for (Link l : TELEPORTERS.values()) { // heal asymmetric/corrupt links
+			if (l.partner == null) continue;
+			final Link o = TELEPORTERS.get(l.partner);
+			if (o == null || !l.pos.equals(o.partner)) l.partner = null;
+		}
+	}
+
+	static synchronized void clearTeleporters() { TELEPORTERS.clear(); }
+
+	static void writeTeleporters(DataOutputStream out, long[] d) throws IOException {
+		out.writeInt(TELE_TAG);
+		out.writeInt(d.length / 7);
+		for (long v : d) out.writeLong(v);
+	}
+
+	static long[] readTeleporters(DataInputStream in) throws IOException {
+		final int n = in.readInt();
+		if (n < 0 || n > 1_000_000) throw new IOException("Invalid teleporter count: " + n);
+		final long[] d = new long[n * 7];
+		for (int i = 0; i < d.length; i++) d[i] = in.readLong();
+		return d;
 	}
 }
