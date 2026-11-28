@@ -10,7 +10,6 @@ import java.lang.invoke.MethodHandle;
 import java.math.BigDecimal;
 import java.nio.file.*;
 import java.text.*;
-import java.time.Duration;
 import java.util.*;
 import java.util.List;
 import java.util.concurrent.*;
@@ -49,7 +48,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	volatile static long focusTime, hoveredX = NO_POS, hoveredY = NO_POS, hoveredZ = NO_POS, newHoverX = NO_POS, newHoverY = NO_POS, newHoverZ = NO_POS;
 	volatile static int dirX, dirY, dirZ, newDirX, newDirY, newDirZ;
 	static long activity = System.currentTimeMillis(), time, fps, frames, x0 = NO_POS, y0 = NO_POS, z0 = NO_POS, x1 = NO_POS, y1 = NO_POS, z1 = NO_POS, fpsTime = System.currentTimeMillis();
-	final static byte BLOCK_COUNT = 52, AXIS_X = 0, AXIS_Y = 1, AXIS_Z = 2, CROSS = 28, perlinRes = 127;
+	final static byte BLOCK_COUNT = 53, AXIS_X = 0, AXIS_Y = 1, AXIS_Z = 2, CROSS = 28, perlinRes = 127;
 	final static int MAGIC = 0x4E585341;    // "NXSA" (3 x 64-bit chunk keys)
 	final static int MAGIC_V9 = 0x4E585339; // legacy packed keys
 	final static int MAGIC_V8 = 0x4E585338; // legacy
@@ -64,12 +63,12 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	record GenJob(long cx, long cy, long cz, Pos3 key, Future<Octree> future, boolean features, boolean cached, int epoch) {}
 	static final double[] PERLIN = new double[perlinRes + 1];
 	static volatile byte[] hotbar = new byte[]{};
-	public static String VERSION = "2.6-beta.2";
+	public static String VERSION = "2.6-beta.3";
 	volatile static String hoveredType;
-	static Vec3 light = new Vec3(0), sunColor = new Vec3(0), ambColor = new Vec3(0), skyColor = new Vec3(0);
-	static final Vec3 SUN_LOW = new Vec3(1, 0.5, 0), SUN_DAY = new Vec3(1), SUN_NIGHT = new Vec3(0.3, 0.3, 0.5);
-	static final Vec3 AMB_LOW = new Vec3(0.6, 0.5, 0.5), AMB_DAY = new Vec3(0.5), AMB_NIGHT = new Vec3(0.3, 0.3, 0.5);
-	static final Vec3 SKY_LOW = Vec3.rgb(0x463C53), SKY_DAY = Vec3.rgb(0x51BAF7), SKY_NIGHT = new Vec3(0);
+	static final double[] light = new double[3], sunColor = new double[3], ambColor = new double[3], skyColor = new double[3];
+	static final double[] SUN_LOW = { 1, 0.5, 0 }, SUN_DAY = { 1, 1, 1 }, SUN_NIGHT = { 0.3, 0.3, 0.5 };
+	static final double[] AMB_LOW = { 0.6, 0.5, 0.5 }, AMB_DAY = { 0.5, 0.5, 0.5 }, AMB_NIGHT = { 0.3, 0.3, 0.5 };
+	static final double[] SKY_LOW = rgb(0x463C53), SKY_DAY = rgb(0x51BAF7), SKY_NIGHT = { 0, 0, 0 };
 	static JFrame frame;
 	static boolean fullscreen;
 	static volatile boolean paused = false, dialogOpen = false, modifyUi = false;
@@ -180,11 +179,10 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 			MOSS = 31, TANZANITE = 32, RHODONITE = 33, BASALT = 34, MARBLE = 35, BIRCH_LOG = 36, BIRCH_PLANKS = 37,
 			RED_LEAVES = 38, ORANGE_LEAVES = 39, YELLOW_LEAVES = 40, AUTUMN_GRASS = 41, TILE = 42,
 			GOLD = 43, GOLD_ORE = 44, DIAMOND = 45, QUARTZ = 46, ACTIVATOR = 47,
-			HEART_CRYSTAL = 48, REGEN_CRYSTAL = 49, HASTE_CRYSTAL = 50, MINOR_REGEN_CRYSTAL = 51;
+			HEART_CRYSTAL = 48, REGEN_CRYSTAL = 49, HASTE_CRYSTAL = 50, MINOR_REGEN_CRYSTAL = 51, NUKE = 52;
 	static volatile int lightQ = 2;   // 0 basic, 1 AO + glow, 2 AO + skylight
-	static volatile boolean lanternEnabled = false, blockLightingEnabled = true;
+	static volatile boolean blockLightingEnabled = true;
 	private long lastBlockLightDensityKey;
-	static final String[] LIGHT_NAMES = { "Basic", "AO + Glow", "AO + Skylight" };
 	static double caveMix;            // 0 = outside, 1 = deep underground (smoothed)
 	static final float[] GLOW = glow();
 	/** When enabled, every chunk is retained in the active .nexus save and restored before regeneration. */
@@ -206,7 +204,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 			{ BIRCH_LOG, BIRCH_PLANKS, RED_LEAVES, ORANGE_LEAVES, YELLOW_LEAVES, AUTUMN_GRASS, GOLD_ORE, GOLD, TILE },
 			{ COAL_ORE, COPPER_ORE, IRON_ORE, COAL, COPPER, IRON, MAGMA, OBSIDIAN, MOSS },
 			{ RUBY, SAPPHIRE, AMETHYST, DIAMOND, QUARTZ, CLAY, GRAVEL, BASALT, MARBLE },
-			{ CHECKERBOARD, ACTIVATOR, HEART_CRYSTAL, REGEN_CRYSTAL, HASTE_CRYSTAL, MINOR_REGEN_CRYSTAL, AIR, AIR, AIR }, };
+			{ CHECKERBOARD, ACTIVATOR, HEART_CRYSTAL, REGEN_CRYSTAL, HASTE_CRYSTAL, MINOR_REGEN_CRYSTAL, NUKE, AIR, AIR }, };
 	static final byte[] XOR_PAGE = { BRICKS, DIRT, GRASS, OAK_LOG, STONE, LEAVES, GLASS, SLATE, AIR };
 
 	//  							RUBY      SAPPH     AMETH     COPPER    IRON ORE  COP_ORE   COAL ORE  OBSIDIAN
@@ -250,7 +248,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		NAMES[BASALT] = "Basalt"; NAMES[MARBLE] = "Marble"; NAMES[BIRCH_LOG] = "Birch Log"; NAMES[BIRCH_PLANKS] = "Birch Planks";
 		NAMES[RED_LEAVES] = "Red Leaves"; NAMES[ORANGE_LEAVES] = "Orange Leaves"; NAMES[YELLOW_LEAVES] = "Yellow Leaves";
 		NAMES[AUTUMN_GRASS] = "Autumn Grass"; NAMES[TILE] = "Tile"; NAMES[GOLD] = "Gold";
-		NAMES[GOLD_ORE] = "Gold Ore"; NAMES[DIAMOND] = "Diamond"; NAMES[QUARTZ] = "Quartz";
+		NAMES[GOLD_ORE] = "Gold Ore"; NAMES[DIAMOND] = "Diamond"; NAMES[QUARTZ] = "Quartz"; NAMES[NUKE] = "Nuke";
 		Activator.registerNames();
 	}
 	// ======================= SURVIVAL =======================
@@ -259,7 +257,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	static final long DAMAGE_COOLDOWN_MS = 500;
 	static final double FALL_SAFE = 10, FALL_EXTRA = 20; // 1 dmg at 10 blocks, +1 per extra 20
 	static volatile int health = MAX_HEALTH;
-	static long lastDamageMs;
+	static long lastDamageMs, lastRegenMs;
 	static double fallDist;
 	static volatile int countFontSize = 12;                     // stack-count font (cycled in General Settings)
 	static BasicStroke hotbarStroke = new BasicStroke(3);
@@ -422,17 +420,17 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		if (!survival) return;
 		survivalBreakTick();
 		if (dead) { fallDist = 0; return; }
-		double dy = diff(y, prevY);                              // +y is down
+		double dy = diff(y, prevY);
 		if (fly || wasStuck || dy < 0) fallDist = 0; else fallDist += dy;
-		if (vy0 > 0 && velY <= 0) {                              // landed this tick
+		if (vy0 > 0 && velY <= 0) {
 			if (fallDist >= FALL_SAFE) damage(1 + (int) ((fallDist - FALL_SAFE) / FALL_EXTRA));
 			fallDist = 0;
 		}
 		if (below == MAGMA) damage(1);
 		long now = System.currentTimeMillis();
-		if (!dead && health < Activator.maxHealth() && now - lastDamageMs >= 30_000L) {
+		if (!dead && health < Activator.maxHealth() && now - Math.max(lastDamageMs, lastRegenMs) >= 30_000L) {
 			health++;
-			lastDamageMs = now; // another point can regenerate after the next 30 damage-free seconds
+			lastRegenMs = now;
 		}
 	}
 
@@ -532,20 +530,17 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		return world.chunk(x >> SHIFT, y >> SHIFT, z >> SHIFT) == World.UNLOADED;
 	}
 
-	/** Survival fill: costs one held-type block per changed voxel, refunds every block it replaces. */
-	private static void fillFromInventory(byte block, long x0, long y0, long z0, long x1, long y1, long z1) {
-		long[] need = new long[256], repl = new long[256];
-		for (long a = x0; a < x1; a++)
-			for (long b = y0; b < y1; b++)
-				for (long c = z0; c < z1; c++) {
-					if (isLoaded(a, b, c)) continue;
-					byte cur = getBlock(a, b, c);
-					if (cur == block) continue;
-					if (block != AIR) need[block & 0xFF]++;
-					if (cur != AIR) repl[cur & 0xFF]++;
-				}
+	private static void fillFromInventory(byte block, long ax, long ay, long az, long bx, long by, long bz, boolean replaceOnly) {
+		final long[] need = new long[256], repl = new long[256];
+		forEachVoxel(ax, ay, az, bx, by, bz, (px, py, pz) -> {
+			if (isLoaded(px, py, pz)) return;
+			final byte cur = getBlock(px, py, pz);
+			if (cur == block || (replaceOnly && cur == AIR)) return;
+			if (block != AIR) need[block & 0xFF]++;
+			if (cur != AIR) repl[cur & 0xFF]++;
+		});
 		if (commitInventory(need, repl)) return;
-		fill(block, x0, y0, z0, x1, y1, z1, true);
+		fillBox(block, ax, ay, az, bx, by, bz, replaceOnly);
 		chunkDirty = true;
 	}
 
@@ -591,6 +586,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	static void main() {
 		deleteStaleTmp();
 		deleteOrphanBackups();
+		loadSettings();
 		Runtime.getRuntime().addShutdownHook(new Thread(Nexus::saveOnShutdown, "nexus-shutdown-save"));
 		frame = new JFrame("Bitwise Nexus " + VERSION);
 		Nexus nexus = new Nexus();
@@ -658,7 +654,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	static float[] glow() {
 		float[] a = new float[BLOCK_COUNT];
 		a[MAGMA] = 0.9f; a[RUBY] = 0.3f; a[AMETHYST] = 0.3f; a[SAPPHIRE] = 0.25f;
-		a[TOPAZ] = 0.25f; a[DIAMOND] = 0.25f; a[EMERALD] = 0.2f; a[DYNAMITE] = 0.05f;
+		a[TOPAZ] = 0.25f; a[DIAMOND] = 0.25f; a[EMERALD] = 0.2f;
 		a[TANZANITE] = 0.2f; a[RHODONITE] = 0.2f; a[QUARTZ] = 0.15f;
 		return a;
 	}
@@ -682,6 +678,12 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		if (caveMix <= 0.95) return radius;
 		int fogR = (int) Math.ceil(dist / (1.5 * SIZE));
 		return Math.clamp(fogR, 1, Math.min(radius, UNDERGROUND_RADIUS_CAP));
+	}
+
+	/** Keeps the lattice centred on the camera while in a cave, or about to enter one, so it is already built when the fog fades in. */
+	private static void updateCaveFog() {
+		if (caveMix <= 0.002 && caveTarget < 0.5) return;
+		CaveFog.request(floorOf(viewX), floorOf(viewY), floorOf(viewZ), CaveFog.radiusFor(dist));
 	}
 
 	static void updateCaveMix() {
@@ -800,19 +802,24 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		prevZ.set(z);
 	}
 
-	private static int cachedRate = 60;
-	private static long rateStamp;
+	private static volatile int cachedRate = 60;
+	private static volatile long rateStamp;
+	private static final AtomicBoolean rateBusy = new AtomicBoolean();
 
 	private static int getRefreshRate() {
-		long n = System.currentTimeMillis();
-		if (n - rateStamp > 300000) {
+		final long n = System.currentTimeMillis();
+		if (n - rateStamp > 300000 && rateBusy.compareAndSet(false, true)) {
 			rateStamp = n;
-			int rate = GraphicsEnvironment.getLocalGraphicsEnvironment().getDefaultScreenDevice().getDisplayMode().getRefreshRate();
-			cachedRate = rate > 0 && rate < 1000 ? rate : 60;
+			Thread.ofPlatform().name("nexus-refresh-rate").daemon().start(() -> {
+				try {
+					int rate = GraphicsEnvironment.getLocalGraphicsEnvironment().getDefaultScreenDevice().getDisplayMode().getRefreshRate();
+					cachedRate = rate > 0 && rate < 1000 ? rate : 60;
+				} catch (Throwable _) {
+				} finally { rateBusy.set(false); }
+			});
 		}
 		return cachedRate;
 	}
-
 
 	private static void limitFrame(long frameStartNs) {
 		if (!vSync) return;
@@ -1268,30 +1275,43 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	}
 
 	static void musicLoop() {
-		try { Thread.sleep(Duration.ofSeconds(60)); } catch (InterruptedException _) { Thread.currentThread().interrupt(); return; }
+		long nextStart = System.currentTimeMillis() + 60_000L;
 		while (true) {
 			try {
-				if (!musicEnabled) { Thread.sleep(1000); continue; }
+				if (!musicEnabled) { musicVoice = null; Thread.sleep(1000); continue; }
 				final String[] track = BYTEBEAT[nextTrack()];
 				final int rate = Integer.parseInt(track[2]);
-				final short[] samples = renderBytebeat(track, rate);
+				short[] samples = renderBytebeat(track, rate);          // slow and gentle, during the quiet gap
+				long wait;
+				while ((wait = nextStart - System.currentTimeMillis()) > 0 && musicEnabled)
+					Thread.sleep(Math.min(wait, 250));
+				if (!musicEnabled) continue;
 				musicVoice = new MusicVoice(samples, samples.length, rate);
+				samples = null;                                         // don't keep a second 16 MB reference alive
 				say("Now playing: " + track[0] + " by " + track[1]);
 				while (musicVoice != null && !musicVoice.finished() && musicEnabled) Thread.sleep(100);
 				musicVoice = null;
-				Thread.sleep(Duration.ofSeconds(60));
+				nextStart = System.currentTimeMillis() + 60_000L;
 			} catch (InterruptedException _) {
 				Thread.currentThread().interrupt(); return;
 			} catch (Throwable e) {
 				System.err.println("Bytebeat player error: " + e);
-				e.printStackTrace();
 				musicVoice = null;
 				try { Thread.sleep(5000); } catch (InterruptedException _) { Thread.currentThread().interrupt(); return; }
 			}
 		}
 	}
 
+	private static long bbMark;
+
+	static void bbThrottle() {
+		final long now = System.nanoTime();
+		if (bbMark != 0) LockSupport.parkNanos(Math.min((now - bbMark) * 2, 50_000_000L));
+		bbMark = System.nanoTime();
+	}
+
 	static short[] renderBytebeat(String[] track, int rate) {
+		bbMark = 0;
 		return renderBytebeatJava(track[0], rate * BB_MAX_SECONDS);
 	}
 
@@ -1314,7 +1334,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 				double noise = RND.nextDouble() * ((-ti >> 7) & 63);
 				v = (x0 / 4.0 + x1 / 4.0 + x2 / 8.0 + x3 / 8.0 + noise + 32.0 * Math.sin(3.0 * Math.sqrt(ti % 16384L))) / 3.0 + 64.0;
 			} else if ("Useless1".equals(name)) {
-				int[] notes={-8,-5,2,4,7,14,7,4,2,-5,-8,-5,2,4,7,14,-10,-6,1,2,6,13,6,2,1,-6,-10,-6,1,2,6,13};
+				final int[] notes = USELESS_NOTES;
 				String melody="12132210", scale="34567777";
 				int ni=((int) (double) i >> 13) & 31;
 				double pitch = (double) i * 3.5 * Math.pow(2.0, notes[ni] / 12.0);
@@ -1388,14 +1408,12 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 				}
 				v = ch;
 			}
+			if ((i & 0x7FFF) == 0x7FFF) bbThrottle();
 			out[i]=(short)Math.round(normalizeBytebeat(v)*32767f);
 		}
 		return out;
 	}
 
-	// Fast Java equivalent of x=t=>(1.22*t*1.0596**parseInt(...,36)&128)*(-t>>8&31)/16.
-	// The source selects one of eight fixed characters; cache their base-36 powers instead of
-	// parsing strings and exponentiating on every sample.
 	static final double[] E_PITCH = { Math.pow(1.0596, 17), 1,
 			Math.pow(1.0596, 12), Math.pow(1.0596, 10), Math.pow(1.0596, 17),
 			1.0596, Math.pow(1.0596, 13), Math.pow(1.0596, 12) };
@@ -1409,17 +1427,19 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		return gate * envelope / 16.0;
 	}
 
+	private static final int[] STEADY_NOTES = { -1, 4, 7 };
+	static final int[] USELESS_NOTES = {-8,-5,2,4,7,14,7,4,2,-5,-8,-5,2,4,7,14,-10,-6,1,2,6,13,6,2,1,-6,-10,-6,1,2,6,13};
+
 	static double steady(double T, double t) {
-		int ti=(int)T; double b=Math.abs((ti&31)-16);
-		double K=1+((1-((ti>>5)&3))%2-1)/6.0;
-		int[] notes={-1,4,7};
-		int n=Math.floorMod((int)(T*4%3),3);
-		double first=(int)(t*Math.pow(2,notes[n]/12.0+K))&128;
-		first *= ((ti>>8)!=0?12-T%12:0)/12.0;
-		int divisor=((ti>>9)!=0?4:5);
-		int table=(5514 >> ((int)(b%divisor)*4))&15;
-		double second=(int)(t*Math.pow(2,K+(int)(b/5)-table/12.0))&128;
-		return first+second;
+		int ti = (int) T; double b = Math.abs((ti & 31) - 16);
+		double K = 1 + ((1 - ((ti >> 5) & 3)) % 2 - 1) / 6.0;
+		int n = Math.floorMod((int) (T * 4 % 3), 3);
+		double first = (int) (t * Math.pow(2, STEADY_NOTES[n] / 12.0 + K)) & 128;
+		first *= ((ti >> 8) != 0 ? 12 - T % 12 : 0) / 12.0;
+		int divisor = ((ti >> 9) != 0 ? 4 : 5);
+		int table = (5514 >> ((int) (b % divisor) * 4)) & 15;
+		double second = (int) (t * Math.pow(2, K + (int) (b / 5) - table / 12.0)) & 128;
+		return first + second;
 	}
 
 	static double crystal(double t) {
@@ -1525,6 +1545,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 			System.err.println("Nexus audio mixer could not open/play audio: " + e);
 			e.printStackTrace();
 			sound = false;
+			musicEnabled = false;
 		}
 	}
 
@@ -1574,7 +1595,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 
 	private void run() {
 		try {
-			spawn();
+			initMenuView();
 			center();
 			textures();
 			init();
@@ -1605,7 +1626,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 				long autosaveNow = System.currentTimeMillis();
 				// The title-screen preview reuses the renderer/camera, but it is not a playable
 				// world. Never let its forced preview coordinates overwrite a saved world.
-				if (!mainMenu && persistentStorage && activeSaveFile != null && autosaveNow - lastPersistentSave >= 60_000L) {
+				if (!mainMenu && persistentStorage && activeSaveFile != null && autosaveDue(autosaveNow)) {
 					requestedSaveFile = activeSaveFile;
 					saveRequested = true;
 					lastPersistentSave = autosaveNow;
@@ -1664,12 +1685,12 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 						}
 					} else worldLoadReadyAt = 0L;
 				}
-				// Do not serialize the entire world on the simulation thread. Persistent
-				// chunks are retained in savedChunks as they unload and written on Save.
 				if (needGround) {
 					needGround = false;
-					groundY(floorOf(x), floorOf(z));
-					velX = velY = velZ = 0;
+					if (!mainMenu) {
+						groundY(floorOf(x), floorOf(z));
+						velX = velY = velZ = 0;
+					}
 				}
 				if (update) {
 					update = false;
@@ -1687,21 +1708,11 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 				cosYaw = Math.cos(yaw);
 				sinPitch = Math.sin(pitch);
 				cosPitch = Math.cos(pitch);
-				light.y = Math.sin(-time / 6000.0);
-				light.z = Math.cos(-time / 6000.0);
-				if (light.y < 0) {
-					Vec3.lerp(SUN_LOW, SUN_DAY, -light.y, sunColor);
-					Vec3.lerp(AMB_LOW, AMB_DAY, -light.y, ambColor);
-					Vec3.lerp(SKY_LOW, SKY_DAY, -light.y, skyColor);
-				} else {
-					Vec3.lerp(SUN_LOW, SUN_NIGHT, light.y, sunColor);
-					Vec3.lerp(AMB_LOW, AMB_NIGHT, light.y, ambColor);
-					Vec3.lerp(SKY_LOW, SKY_NIGHT, light.y, skyColor);
-				}
-
+				updateSky();
 				start = runTicks(start);
 				updateView();
 				updateCaveMix();
+				updateCaveFog();
 
 				final boolean reuse = sceneUnchanged();
 				if (!reuse) {
@@ -1732,6 +1743,26 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		}
 	}
 
+	static double[] rgb(int c) { return new double[] { (c >> 16 & 0xFF) / 255.0, (c >> 8 & 0xFF) / 255.0, (c & 0xFF) / 255.0 }; }
+
+	static void lerp(double[] a, double[] b, double t, double[] out) {
+		for (int i = 0; i < 3; i++) out[i] = a[i] + (b[i] - a[i]) * t;
+	}
+
+	private static void updateSky() {
+		light[1] = Math.sin(-time / 6000.0);
+		light[2] = Math.cos(-time / 6000.0);
+		if (light[1] < 0) {
+			lerp(SUN_LOW, SUN_DAY, -light[1], sunColor);
+			lerp(AMB_LOW, AMB_DAY, -light[1], ambColor);
+			lerp(SKY_LOW, SKY_DAY, -light[1], skyColor);
+		} else {
+			lerp(SUN_LOW, SUN_NIGHT, light[1], sunColor);
+			lerp(AMB_LOW, AMB_NIGHT, light[1], ambColor);
+			lerp(SKY_LOW, SKY_NIGHT, light[1], skyColor);
+		}
+	}
+
 	private static void drainTasks() {
 		Runnable t;
 		while ((t = tasks.poll()) != null) {
@@ -1739,24 +1770,107 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		}
 	}
 
+	record Background(String name, SplitDecimal x, SplitDecimal y, SplitDecimal z, double yaw, double pitch, int dist, double amp) { }
+	static volatile List<Background> backgrounds = defaultBackgrounds();
+	static volatile int backgroundIndex = 0;
+	static final String SETTINGS_FILE = "settings.txt";
+
+	static List<Background> defaultBackgrounds() { // y is the internal value (+y is down)
+		return List.of(
+				new Background("Default", new SplitDecimal(-500), new SplitDecimal(-30), new SplitDecimal(-22000), 0.5, -0.2, 768, 1),
+				new Background("Old", new SplitDecimal(15493), new SplitDecimal(96), new SplitDecimal(17236), 1.2, -2.0 / 3.0, 368, 1),
+				new Background("Mountains", new SplitDecimal(-180), new SplitDecimal(-130), new SplitDecimal(-50), 2.0, 0.0, 1024, 1));
+	}
+
+	static Background currentBackground() {
+		final List<Background> l = backgrounds;
+		return l.get(Math.floorMod(backgroundIndex, l.size()));
+	}
+
+	private static Path settingsFile() { return sharedWorldsPath().resolve(SETTINGS_FILE); }
+
+	/** name|x|y|z|yaw|pitch|renderDistance|amplitude */
+	private static Background parseBackground(String v) {
+		try {
+			final String[] p = v.split("\\|", -1);
+			if (p.length != 8) return null;
+			final String name = p[0].strip();
+			if (name.isEmpty()) return null;
+			final SplitDecimal bx = parseCoord(p[1]), bz = parseCoord(p[3]), by = new SplitDecimal();
+			parseCoord(p[2]).negate(by);
+			final double yw = Double.parseDouble(p[4].strip()), pt = Double.parseDouble(p[5].strip());
+			if (!Double.isFinite(yw) || !Double.isFinite(pt)) return null;
+			final double amp = Double.parseDouble(p[7].strip());
+			return new Background(name, bx, by, bz, yw, pt, Integer.parseInt(p[6].strip()), amp);
+		} catch (RuntimeException _) { return null; }
+	}
+
+	private static String formatBackground(Background b) {
+		return b.name().replace('|', '/') + "|" + coordStr(b.x(), false) + "|" + coordStr(b.y(), true) + "|" + coordStr(b.z(), false)
+				+ "|" + b.yaw() + "|" + b.pitch() + "|" + b.dist() + "|" + b.amp();
+	}
+
+	static void loadSettings() {
+		List<Background> list = new ArrayList<>();
+		String selected = null;
+		final Path f = settingsFile();
+		final boolean existed = Files.isRegularFile(f);
+		if (existed) {
+			try {
+				for (String raw : Files.readAllLines(f)) {
+					final String line = raw.strip();
+					if (line.isEmpty() || line.startsWith("#")) continue;
+					final int eq = line.indexOf('=');
+					if (eq < 0) continue;
+					final String k = line.substring(0, eq).strip().toLowerCase(Locale.ROOT), v = line.substring(eq + 1).strip();
+					if (k.equals("selected")) selected = v;
+					else if (k.equals("bg")) { final Background b = parseBackground(v); if (b != null) list.add(b); }
+				}
+			} catch (IOException e) { System.err.println("Could not read settings.txt: " + e); }
+		}
+		if (list.isEmpty()) list = new ArrayList<>(defaultBackgrounds());
+		int idx = 0;
+		for (int i = 0; i < list.size(); i++) if (list.get(i).name().equalsIgnoreCase(selected)) idx = i;
+		backgrounds = List.copyOf(list);
+		backgroundIndex = idx;
+		if (!existed) saveSettings();
+	}
+
+	static void saveSettings() {
+		try {
+			Files.createDirectories(sharedWorldsPath());
+			final StringBuilder sb = new StringBuilder();
+			sb.append("# Bitwise Nexus background settings\n");
+			sb.append("# bg=<name>|<x>|<y>|<z>|<yaw>|<pitch>|<render distance>|<amplitude>\n");
+			sb.append("selected=").append(currentBackground().name()).append('\n');
+			for (Background b : backgrounds) sb.append("bg=").append(formatBackground(b)).append('\n');
+			Files.writeString(settingsFile(), sb);
+		} catch (IOException e) { say("Could not save settings.txt: " + e.getMessage()); }
+	}
+
+	/** Next background: saved immediately, and the title-screen camera jumps there at once. In-game it only saves. */
+	static void cycleBackground() {
+		backgroundIndex = (backgroundIndex + 1) % backgrounds.size();
+		saveSettings();
+		if (mainMenu) tasks.add(Nexus::applyBackgroundNow);
+	}
+
+	private static void applyBackgroundNow() {
+		mainMenuPosition(true, true);
+		prevX.set(x); prevY.set(y); prevZ.set(z);
+		reloadChunks(false);
+	}
+
 	private static synchronized void mainMenuPosition(boolean resetYaw, boolean resetDist) {
 		if (!mainMenu) return;
+		final Background b = currentBackground();
 		fly = true;
 		velX = velY = velZ = 0;
-//		setting 1
-//	    x.setValue(15493); y.setValue(96); z.setValue(17236);
-//	    pitch = -2.0 / 3.0;
-//	    if (resetYaw) yaw = 1.2;
-//	    if (resetDist) setDist(368);
-//		setting 2
-//		x.setValue(-180); y.setValue(-130); z.setValue(-50);
-//		pitch = 0;
-//		if (resetYaw) yaw = 2;
-//		if (resetDist) setDist(1024);
-		x.setValue(-500); y.setValue(-30); z.setValue(-22000);
-		pitch = -0.2;
-		if (resetYaw) yaw = 0.5;
-		if (resetDist) setDist(768);
+		x.set(b.x()); y.set(b.y()); z.set(b.z());
+		pitch = b.pitch();
+		amp = b.amp();
+		if (resetYaw) yaw = b.yaw();
+		if (resetDist) setDist(b.dist());
 	}
 
 	static boolean computeIdle() {
@@ -1819,20 +1933,9 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 
 		if (fire(KeyEvent.VK_F6, 200)) vSync = !vSync;
 		if (fire(KeyEvent.VK_F7, 500)) fill = true;
-		if (fill && fire(KeyEvent.VK_C, 250)) copyMode = !copyMode;
-		if (fire(KeyEvent.VK_F8, 500)) {
-			fill = false;
-			boolean all = x0 != NO_POS && y0 != NO_POS && z0 != NO_POS && x1 != NO_POS && y1 != NO_POS && z1 != NO_POS;
-			if (all) {
-				long ax = Math.min(x0, x1), ay = Math.min(y0, y1), az = Math.min(z0, z1);
-				long bx = Math.max(x0, x1) + 1, by = Math.max(y0, y1) + 1, bz = Math.max(z0, z1) + 1;
-				if (copyMode) copyRegion(ax, ay, az, bx, by, bz);
-				else if (survival) fillFromInventory(hotbar[heldBlock], ax, ay, az, bx, by, bz);
-				else fill(hotbar[heldBlock], ax, ay, az, bx, by, bz, true);
-			}
-			copyMode = false;
-			x0 = y0 = z0 = x1 = y1 = z1 = NO_POS;
-		}
+		if (fill && fire(KeyEvent.VK_C, 250)) { copyMode = !copyMode; if (copyMode) replaceMode = false; }
+		if (fill && fire(KeyEvent.VK_R, 250)) { replaceMode = !replaceMode; if (replaceMode) copyMode = false; }
+		if (fire(KeyEvent.VK_F8, 500)) executeFill();
 		if (fire(KeyEvent.VK_F9, 150) && fire(KeyEvent.VK_0, 150)) toggleGamemode();
 		if (fire(KeyEvent.VK_F12, 300)) { gpuEnabled = !gpuEnabled; if (gpuEnabled) GpuTracer.retry(); say("GPU renderer " + (gpuEnabled ? "enabled" : "disabled")); }
 		if (key(KeyEvent.VK_U)) showFPS = showXYZ = showRot = showCyan = showMagenta = showExtra = true;
@@ -1843,10 +1946,6 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 			say("Locate: " + LOC_NAMES[locTarget] + " (B to teleport)");
 		}
 		if (!survival && fire(KeyEvent.VK_B, 500)) locate(locTarget);
-		if (fire(KeyEvent.VK_L, 250)) {
-			lightQ = (lightQ + 1) % 3;
-			say("Lighting: " + LIGHT_NAMES[lightQ]);
-		}
 	}
 
 	/** Flips creative <-> survival in place (inventory and upgrades are kept). */
@@ -1896,6 +1995,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	private static long lastSig, lastSigTime;
 	private static boolean sigValid;
 	static boolean shadowRetry;
+	private static int shadowRetryStream = -1;
 
 	private static long sigMix(long h, long v) { h = (h ^ v) * 0x9E3779B97F4A7C15L; return h ^ (h >>> 31); }
 
@@ -1905,8 +2005,10 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 			Render.shadowProvisional = false;
 			shadowRetry = true;
 		}
-		if (shadowRetry && jobs.isEmpty() && featureQueue.isEmpty()) {
+		// Retry at most once per stream version: if nothing new loaded, a retry cannot improve the result.
+		if (shadowRetry && jobs.isEmpty() && featureQueue.isEmpty() && streamVer != shadowRetryStream) {
 			shadowRetry = false;
+			shadowRetryStream = streamVer;
 			worldVer++;
 			sigValid = false;
 			return false;
@@ -1917,8 +2019,8 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		h = sigMix(h, Double.doubleToLongBits(focal));
 		h = sigMix(h, width * 65536L + height); h = sigMix(h, detail); h = sigMix(h, dist); h = sigMix(h, reach);
 		h = sigMix(h, ((long) worldVer << 32) ^ streamVer);
-		h = sigMix(h, lightQ | (classic ? 4 : 0) | (xor ? 8 : 0) | (lanternEnabled ? 16 : 0) | (display ? 32 : 0)
-				| (hideEverything ? 64 : 0) | (caves ? 128 : 0) | (terrain3D ? 256 : 0) | (blockLightingEnabled ? 512 : 0) | (gpuEnabled ? 1024 : 0));
+		h = sigMix(h, ((long) lightVer << 8) ^ blockLightDensity);
+		h = sigMix(h, lightQ | (classic ? 4 : 0) | (xor ? 8 : 0) | (display ? 32 : 0) | (hideEverything ? 64 : 0) | (caves ? 128 : 0) | (terrain3D ? 256 : 0) | (blockLightingEnabled ? 512 : 0) | (gpuEnabled ? 1024 : 0));
 		h = sigMix(h, Double.doubleToLongBits(AO_STRENGTH));
 		h = sigMix(h, Double.doubleToLongBits(red)); h = sigMix(h, Double.doubleToLongBits(green)); h = sigMix(h, Double.doubleToLongBits(blue));
 		h = sigMix(h, Math.round(caveMix * 1000));
@@ -1968,14 +2070,15 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 			velX = velY = velZ = 0; // wait for the chunk under to arrive
 			return;
 		}
-		velX *= 0.5;
-		velZ *= 0.5;
+		velX *= 0.5; velZ *= 0.5;
 		velX += sinYaw * inputZ + cosYaw * inputX;
 		velZ += cosYaw * inputZ - sinYaw * inputX;
+		velX += kbX; velZ += kbZ;
 		if (!fly) {
 			velY += 0.003;
 		} else {
 			velY = 0;
+			velY += kbY;
 			if (key(KeyEvent.VK_SHIFT))
 				velY += flight;
 			if (key(KeyEvent.VK_SPACE))
@@ -2030,6 +2133,14 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 
 		double dxMoved = diff(x, prevX), dzMoved = diff(z, prevZ);
 		double moved = (dxMoved == 0.0 && dzMoved == 0.0) ? 0.0 : Math.hypot(dxMoved, dzMoved);
+		if (kbX != 0 || kbY != 0 || kbZ != 0) {
+			if (kbX != 0 && Math.abs(dxMoved) < Math.abs(velX) * 0.25) kbX = 0; // hit a wall
+			if (kbZ != 0 && Math.abs(dzMoved) < Math.abs(velZ) * 0.25) kbZ = 0;
+			kbX *= KB_DECAY; kbY *= KB_DECAY; kbZ *= KB_DECAY;
+			if (Math.abs(kbX) < 1e-4) kbX = 0;
+			if (Math.abs(kbY) < 1e-4) kbY = 0;
+			if (Math.abs(kbZ) < 1e-4) kbZ = 0;
+		}
 		step(fly ? AIR : below, moved);
 		Particles.sprintTrail(fly ? AIR : below, moved);
 		Particles.update();
@@ -2108,6 +2219,16 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		// The generated column contains no solid terrain; use its finite lower boundary,
 		// never a potentially corrupted/unbounded noise estimate.
 		Nexus.y.setValue(end - 1.54);
+	}
+
+	/** Puts the camera at the title-screen view before the first frame. No ground search, no spawn column generation. */
+	private static void initMenuView() {
+		fly = true;
+		needGround = false;
+		worldLoading = false;
+		mainMenuPosition(true, true);
+		prevX.set(x); prevY.set(y); prevZ.set(z);
+		chunkDirty = true;
 	}
 
 	private static synchronized void spawn() {
@@ -3889,6 +4010,64 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		say("Copied " + sx + "x" + sy + "x" + sz + " blocks (" + sx * sy * sz + " total blocks)");
 	}
 
+	static volatile boolean replaceMode;
+	static final long FILL_MAX_VOXELS = 1L << 27;
+
+	interface VoxelVisitor { void visit(long x, long y, long z); }
+
+	/** Visits every voxel of an inclusive box. Cannot overflow, even at +-2^63. */
+	private static void forEachVoxel(long ax, long ay, long az, long bx, long by, long bz, VoxelVisitor v) {
+		for (long px = ax;; px++) {
+			for (long py = ay;; py++) {
+				for (long pz = az;; pz++) {
+					v.visit(px, py, pz);
+					if (pz == bz) break;
+				}
+				if (py == by) break;
+			}
+			if (px == bx) break;
+		}
+	}
+
+	private static double boxVolume(long ax, long ay, long az, long bx, long by, long bz) {
+		return ((double) bx - ax + 1) * ((double) by - ay + 1) * ((double) bz - az + 1);
+	}
+
+	/** Creative fill / replace over an inclusive box. replaceOnly leaves air alone. */
+	private static void fillBox(byte block, long ax, long ay, long az, long bx, long by, long bz, boolean replaceOnly) {
+		forEachVoxel(ax, ay, az, bx, by, bz, (px, py, pz) -> {
+			if (replaceOnly) {
+				final byte cur = getBlock(px, py, pz);
+				if (cur == AIR || cur == block) return;
+			}
+			setBlock(px, py, pz, block);
+		});
+	}
+
+	private static void executeFill() {
+		fill = false;
+		if (y0 != NO_POS && y1 != NO_POS) { // y is never NO_POS for a real block, x/z may legitimately be any long
+			final long ax = Math.min(x0, x1), ay = Math.min(y0, y1), az = Math.min(z0, z1);
+			final long bx = Math.max(x0, x1), by = Math.max(y0, y1), bz = Math.max(z0, z1); // inclusive
+			final double vol = boxVolume(ax, ay, az, bx, by, bz);
+			if (copyMode) {
+				if (vol > COPY_MAX_VOXELS) say("Copy region too large");
+				else if (bx == Long.MAX_VALUE || by == Long.MAX_VALUE || bz == Long.MAX_VALUE) say("Copy region is outside the supported range");
+				else copyRegion(ax, ay, az, bx + 1, by + 1, bz + 1);
+			} else if (vol > FILL_MAX_VOXELS) {
+				say("Fill region too large (max " + FILL_MAX_VOXELS + " blocks)");
+			} else if (survival) {
+				fillFromInventory(hotbar[heldBlock], ax, ay, az, bx, by, bz, replaceMode);
+			} else {
+				fillBox(hotbar[heldBlock], ax, ay, az, bx, by, bz, replaceMode);
+				chunkDirty = true;
+			}
+		}
+		copyMode = false;
+		replaceMode = false;
+		x0 = y0 = z0 = x1 = y1 = z1 = NO_POS;
+	}
+
 	private static void outline() {
 		if (survival) return;
 		long cx = chunkOf(x), cy = chunkOf(y), cz = chunkOf(z);
@@ -3916,8 +4095,8 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	}
 
 	/** Fixed blast radius (blocks). The slider and the `power` variable are gone. */
-	static final int BLAST_RADIUS = 5;
-	static final double DMG_POINT_BLANK = 1.0, DMG_CLOSE = 3.0; // 3 dmg <= 1 block, 2 dmg <= 3 blocks, then 1 dmg
+	static final int BLAST_RADIUS = 5, NUKE_BLAST_RADIUS = 25;
+	static final double DMG_POINT_BLANK = 2.0, DMG_CLOSE = 5.0;
 	static volatile boolean gpuEnabled = true;
 	static volatile int atlasVer;
 
@@ -3927,8 +4106,8 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		final double dy = (y.getIntegerPart() - cy) + (y.getFractionalPart() + 0.65 - 0.5); // body centre, not the eyes
 		final double dz = (z.getIntegerPart() - cz) + (z.getFractionalPart() - 0.5);
 		final double d = Math.sqrt(dx * dx + dy * dy + dz * dz);
-		if (d > BLAST_RADIUS + 2) return 0;
-		final int base = d <= DMG_POINT_BLANK ? 3 : d <= DMG_CLOSE ? 2 : 1;
+		if (d > 10) return 0;
+		final int base = d <= DMG_POINT_BLANK ? 5 : d <= DMG_CLOSE ? 3 : 1;
 		int shield = 0;
 		long lx = 0, ly = 0, lz = 0; // last voxel visited, relative to the blast block (the blast block itself is skipped)
 		final int steps = (int) Math.ceil(d * 4);
@@ -3942,18 +4121,45 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		return Math.max(0, base - shield);
 	}
 
-	private static void explode(long centerX, long centerY, long centerZ) {
+	static double kbX, kbY, kbZ;
+	static final double KB_HORIZ = 0.10, KB_VERT = 0.12, KB_DECAY = 0.9, KB_MAX_HORIZ = 0.4, KB_MAX_VERT = 0.4;
+
+	/** Adds the push a blast centred on this block gives the player into out[0..2] (x, y, z; +y is down). */
+	private static void addKnockback(long cx, long cy, long cz, int power, double[] out) {
+		final double dx = (x.getIntegerPart() - cx) + (x.getFractionalPart() - 0.5);
+		final double dy = (y.getIntegerPart() - cy) + (y.getFractionalPart() + 0.65 - 0.5); // body centre
+		final double dz = (z.getIntegerPart() - cz) + (z.getFractionalPart() - 0.5);
+		final double d = Math.sqrt(dx * dx + dy * dy + dz * dz), reach = power * 2.0;
+		if (d >= reach) return;
+		final double f = 1.0 - d / reach, s = power / (double) BLAST_RADIUS * f;
+		final double nx = d < 1e-6 ? 0 : dx / d, ny = d < 1e-6 ? -1 : dy / d, nz = d < 1e-6 ? 0 : dz / d;
+		out[0] += nx * KB_HORIZ * s;
+		out[2] += nz * KB_HORIZ * s;
+		out[1] += (ny * 0.7 - 0.3) * KB_VERT * s; // always a little upward lift
+	}
+
+	private static void applyKnockback(double[] kb) {
+		kbX += kb[0]; kbZ += kb[2];
+		final double h = Math.hypot(kbX, kbZ);
+		if (h > KB_MAX_HORIZ) { kbX *= KB_MAX_HORIZ / h; kbZ *= KB_MAX_HORIZ / h; }
+		if (fly) kbY += kb[1];
+		else velY = Math.max(-KB_MAX_VERT, velY + kb[1]);
+	}
+
+	private static void explode(long centerX, long centerY, long centerZ, boolean isNuke) {
 		boom(centerX, centerY, centerZ);
-		final int power = BLAST_RADIUS, r2 = power * power;
+		final int power = isNuke ? NUKE_BLAST_RADIUS : BLAST_RADIUS, r2 = power * power;
 		final Deque<long[]> stack = new ArrayDeque<>();
 		stack.push(new long[] { centerX, centerY, centerZ });
 		final Set<Pos3> detonated = new HashSet<>();
 		final long[] loot = survival ? new long[256] : null;
 		int worst = 0;
+		final double[] kb = new double[3];
 		while (!stack.isEmpty()) {
 			final long[] c = stack.pop();
 			if (!detonated.add(new Pos3(c[0], c[1], c[2]))) continue;
 			if (survival) worst = Math.max(worst, blastDamage(c[0], c[1], c[2]));
+			addKnockback(c[0], c[1], c[2], power, kb);
 			for (int dx = -power; dx <= power; dx++) {
 				final int remX = r2 - dx * dx;
 				for (int dy = -power; dy <= power; dy++) {
@@ -3971,10 +4177,10 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 							final byte block = f >= 0 ? (byte) f : ch.get((byte) (bx & MASK), (byte) (by & MASK), (byte) (bz & MASK));
 							if (block == AIR) continue;
 							final double energy = power - Math.sqrt(dx * dx + dy * dy + (bz - c[2]) * (double) (bz - c[2]));
-							if (energy <= explosionResistance(block)) continue;
+							if (energy <= explosionResistance(block) && !isNuke) continue;
 							setBlock(bx, by, bz, AIR);
 							Particles.debris(bx, by, bz, block, c[0], c[1], c[2]);
-							if (block == DYNAMITE) stack.push(new long[] { bx, by, bz });
+							if (block == DYNAMITE || block == NUKE) stack.push(new long[] { bx, by, bz });
 							else if (loot != null) loot[block & 0xFF]++;
 						}
 					}
@@ -3982,6 +4188,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 			}
 		}
 		if (worst > 0) damage(worst);
+		applyKnockback(kb);
 		if (loot != null) collectLoot(loot);
 	}
 
@@ -4094,7 +4301,8 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		if (button == 3 && has && emptyHand) {
 			if (Activator.onEmptyHandUse(hx, hy, hz)) return;
 			byte b = getBlock(hx, hy, hz);
-			if (b == DYNAMITE) explode(hx, hy, hz);
+			if (b == DYNAMITE) explode(hx, hy, hz, false);
+			else if (b == NUKE) explode(hx, hy, hz, true);
 			else if (b == EMERALD && !survival) buildTree(hx, hy + 1, hz, 5, new Random());
 		}
 	}
@@ -4124,7 +4332,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 	private static void textures() {
 		Random rand = new Random(7817105610522912629L);
 		for (byte type = 1; type < BLOCK_COUNT; type++) {
-			if (type >= ACTIVATOR) { Activator.paintTexture(type, atlas); continue; }
+			if (type >= ACTIVATOR && type < NUKE) { Activator.paintTexture(type, atlas); continue; }
 			int gsd_tempA = 0;
 			for (byte y = 0; y < 48; y++) {
 				for (byte x = 0; x < 16; x++) {
@@ -4228,6 +4436,10 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 							case DYNAMITE:
 								tint = (x ^ y) * 16;
 								tint = ~(tint << 8 | tint);
+								break;
+							case NUKE:
+								tint = (x ^ y) * 16 + 4;
+								tint = tint << 16 | tint << 8;
 								break;
 							case SNOW:
 								tint = 0xFFFFFF;
@@ -4551,7 +4763,9 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 			ramStamp = n;
 			Runtime rt = Runtime.getRuntime();
 			double used = rt.totalMemory() - rt.freeMemory();
-			ramText = "RAM Used: " + fmtMem(used) + ", VRAM: " + fmtMem(GpuTracer.memLive);
+			ramText = gpuEnabled
+					? "RAM Used: " + fmtMem(used) + ", VRAM: " + fmtMem(GpuTracer.memLive)
+					: "RAM Used: " + fmtMem(used);
 		}
 		return ramText;
 	}
@@ -4692,12 +4906,16 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 					ln(g2d, "Fill mode active!");
 					ln(g2d, "Block A: " + posStr(x0, y0, z0));
 					ln(g2d, "Block B: " + posStr(x1, y1, z1));
-					ln(g2d, "Copy mode " + (copyMode ? "ON" : "OFF"));
+					if (copyMode) {
+						ln(g2d, "Copy mode active!");
+					} if (replaceMode) {
+						ln(g2d, "Replace mode active!");
+					}
 				}
 			}
 		} else if (option == 2 && controlsUIEnabled) {
 			g2d.setColor(Color.white);
-			ln(g2d, "Bitwise Nexus " + VERSION + ", made on November 27, 2026");
+			ln(g2d, "Bitwise Nexus " + VERSION + ", made on November 28, 2026");
 			g2d.setColor(Color.red);
 			ln(g2d, "Interface controls: F1 to hide all, F3 toggles HUD, F4 toggles controls HUD");
 			g2d.setColor(Color.yellow);
@@ -4721,9 +4939,9 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 			ln(g2d, "Switch Hotbar: Q/E");
 			ln(g2d, "Fill Mode: F7; Left/Right Click to set Block A/B; F8 to execute, places held block");
 			ln(g2d, "Copy Mode: C to toggle while Fill Mode is on");
+			ln(g2d, "Replace Mode: R to toggle while Fill Mode is on");
 			ln(g2d, "Spawn Chunk Outline: G");
 			ln(g2d, "Open Teleport Menu: F10");
-			ln(g2d, "Change Lighting: L");
 			ln(g2d, "Locate Feature: N to cycle target, B to teleport");
 			ln(g2d, "Change Block Light Density: O");
 			ln(g2d, "Toggle GPU Renderer: F12");
@@ -5148,6 +5366,18 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		} catch (IOException _) { return false; }
 	}
 
+	private void deleteWorld(File target) {
+		if (target.exists() && deleteWorldFiles(target)) {
+			try { Files.deleteIfExists(backupOf(target)); } catch (IOException _) {}
+			worldModeCache.remove(target.getPath());
+			invalidateWorldList();
+			final int n = discoverSharedWorlds().size();
+			worldSelection = n == 0 ? 0 : Math.min(worldSelection, n - 1);
+			worldScroll = Math.clamp(worldScroll, 0, Math.max(0, n - 1));
+			frontMessage = "World deleted.";
+		} else frontMessage = "Could not delete world.";
+	}
+
 	private void frontMenuClick(int mx, int my) {
 		int gui = frontGuiScale();
 
@@ -5173,18 +5403,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 			} else if (deleteRect.contains(mx, my)) {
 				File target = deleteConfirmWorld;
 				deleteConfirmWorld = null;
-
-				if (target.exists() && deleteWorldFiles(target)) {
-					try { Files.deleteIfExists(backupOf(target)); } catch (IOException _) {}
-					invalidateWorldList();
-					List<File> remaining = discoverSharedWorlds();
-					worldSelection = remaining.isEmpty() ? -1 : Math.min(worldSelection, remaining.size() - 1);
-					worldScroll = Math.clamp(worldScroll, 0, remaining.size() - 1);
-					worldModeCache.remove(target.getPath());
-					frontMessage = "World deleted.";
-				} else {
-					frontMessage = "Could not delete world.";
-				}
+				deleteWorld(target);
 			} else if (mx < dx || mx >= dx + dialogW || my < dy || my >= dy + dialogH) {
 				deleteConfirmWorld = null;
 			}
@@ -5352,7 +5571,10 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		ampCaret = ampAnchor = ampEdit.length();
 	}
 
-	private void createWorld() {
+	private void createWorld() { tasks.add(this::createWorldNow); }
+
+	private void createWorldNow() {
+		if (!mainMenu) return;
 		String name=createWorldName;
 		if(name==null||!name.matches("[A-Za-z0-9_ -]{1,32}")||name.isBlank()){frontMessage="Use letters, numbers, spaces, _ or - (1–32 chars).";return;}
 		try {
@@ -5710,7 +5932,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 
 	// ======================= UI LAYOUT: single source of truth =======================
 	enum Wid { SENS, SOUND_VOL, MUSIC_VOL, SOUND, MUSIC, GUI_SCALE, EXTRA, APPLY,
-		FLIGHT, DIST, FOV, REACH, DEGREES, CLASSIC, BITWISE, FREEZE, LANTERN, AO,
+		FLIGHT, DIST, FOV, REACH, DEGREES, CLASSIC, BITWISE, FREEZE, BACKGROUND, AO,
 		FOG_LABEL, FOG_R, FOG_G, FOG_B, FOG_SWATCH, FOG_HEX, FOG_PICK, BACK,           // FOG_R/G/B must stay consecutive
 		NAME, HINT, GAMEMODE, CAVES, TERRAIN, AMP_NORMAL, AMP_HIGH, AMP_ULTRA, AMP_FIELD, CANCEL, CREATE } // AMP_* must stay consecutive
 	enum WKind { BUTTON, SLIDER, LABEL, HINT, FIELD, SWATCH, CUSTOM }
@@ -5775,10 +5997,10 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 			L.row(SLD_H, sld(Wid.DIST, "Render Distance", tFromDist(dist), dist + " (" + radius + (radius == 1 ? " chunk" : " chunks") + ")"));
 			L.row(SLD_H, sld(Wid.FOV, "FOV", (fov - FOV_MIN) / (FOV_MAX - FOV_MIN), "%.2f°".formatted(fov)));
 			L.row(SLD_H, sld(Wid.REACH, "Block Reach", (reach - 2) / 48.0, Integer.toString(reach)));
-			L.row(32, btn(Wid.DEGREES, "Use Degrees: " + (degrees ? "ON" : "OFF")));
+			L.row(32, btn(Wid.BACKGROUND, "Background: " + currentBackground().name()));
 			L.gap(6);
 			L.row(28, btn(Wid.CLASSIC, "Classic Mode: " + (classic ? "ON" : "OFF")), btn(Wid.BITWISE, "Bitwise Mode: " + (xor ? "ON" : "OFF")));
-			L.row(28, btn(Wid.FREEZE, "Freeze Time: " + (freezeTime ? "ON" : "OFF")), btn(Wid.LANTERN, "Lantern: " + (lanternEnabled ? "ON" : "OFF")));
+			L.row(28, btn(Wid.FREEZE, "Freeze Time: " + (freezeTime ? "ON" : "OFF")), btn(Wid.DEGREES, "Use Degrees: " + (degrees ? "ON" : "OFF")));
 			L.row(SLD_H, sld(Wid.AO, "AO Strength", AO_STRENGTH, "%.2f%s".formatted(AO_STRENGTH, AO_STRENGTH == 0 ? " (Off)" : "")));
 			L.row(16, lbl(Wid.FOG_LABEL, "Fog Color (RGB 0-1)"));
 			final double[] rgb = { Math.clamp(red, 0.0, 1.0), Math.clamp(green, 0.0, 1.0), Math.clamp(blue, 0.0, 1.0) };
@@ -5879,7 +6101,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 			case CLASSIC -> classic = !classic;
 			case BITWISE -> toggleXor();
 			case FREEZE -> freezeTime = !freezeTime;
-			case LANTERN -> lanternEnabled = !lanternEnabled;
+			case BACKGROUND -> cycleBackground();
 			case FOG_R, FOG_G, FOG_B -> { rgbEditChannel = id.ordinal() - Wid.FOG_R.ordinal(); rgbEdit = ""; }
 			case FOG_HEX -> { rgbEditChannel = -2; rgbEdit = ""; }
 			case FOG_PICK -> {
@@ -6026,6 +6248,16 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		});
 	}
 
+	private static SaveSnapshot snapshotOnMainThread(File file) {
+		final CompletableFuture<SaveSnapshot> f = new CompletableFuture<>();
+		tasks.add(() -> {
+			try { flushDirty(); f.complete(new SaveSnapshot(file, changedChunkSnapshot())); }
+			catch (Throwable t) { f.completeExceptionally(t); }
+		});
+		try { return f.get(3, TimeUnit.SECONDS); }
+		catch (Exception e) { return new SaveSnapshot(file, changedChunkSnapshot()); } // main loop stuck: best effort
+	}
+
 	private static void saveOnShutdown() {
 		if (shutdownSaveStarted) return;
 		shutdownSaveStarted = true;
@@ -6033,9 +6265,8 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 			File file = activeSaveFile;
 			if (persistentStorage && file != null) {
 				long deadline = System.currentTimeMillis() + 15_000L;
-				while (saveInProgress.get() && System.currentTimeMillis() < deadline)
-					Thread.sleep(25L);
-				writeSave(new SaveSnapshot(file, changedChunkSnapshot()));
+				while (saveInProgress.get() && System.currentTimeMillis() < deadline) Thread.sleep(25L);
+				writeSave(snapshotOnMainThread(file));
 			}
 		} catch (Throwable t) {
 			System.err.println("Final world save failed: " + t);
@@ -6073,6 +6304,29 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		}
 	}
 
+	static int lastSavedWorldVer = -1;
+
+	/** 60 s when blocks changed, otherwise only every 5 min. */
+	static boolean autosaveDue(long now) {
+		final long since = now - lastPersistentSave;
+		if (since < 60_000L) return false;
+		final int wv = worldVer;
+		if (wv == lastSavedWorldVer && since < 300_000L) return false;
+		lastSavedWorldVer = wv;
+		return true;
+	}
+
+	/** Backup = hard link to the previous save (instant). Falls back to a copy where links aren't supported. */
+	private static void refreshBackup(Path target) {
+		final Path backup = target.resolveSibling(target.getFileName() + ".bak");
+		try {
+			if (Files.exists(backup) && System.currentTimeMillis() - Files.getLastModifiedTime(backup).toMillis() <= 60_000L) return;
+			Files.deleteIfExists(backup);
+			try { Files.createLink(backup, target); }
+			catch (IOException | UnsupportedOperationException | SecurityException _) { Files.copy(target, backup, StandardCopyOption.REPLACE_EXISTING); }
+		} catch (IOException e) { System.err.println("Could not refresh world backup: " + e); }
+	}
+
 	private static void writeSaveLocked(SaveSnapshot s) {
 		Path target = s.file.toPath();
 		Path tmp = target.resolveSibling(target.getFileName() + ".tmp");
@@ -6090,13 +6344,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 					for (int i = 0; i < INV_SLOTS; i++) { out.writeByte(s.sInvId[p][i]); out.writeInt(s.sInvCount[p][i]); }
 				writeChunks(out, s);
 			}
-			if (Files.isRegularFile(target)) {
-				final Path backup = target.resolveSibling(target.getFileName() + ".bak");
-				try {
-					final boolean stale = !Files.exists(backup) || System.currentTimeMillis() - Files.getLastModifiedTime(backup).toMillis() > 60_000L;
-					if (stale) Files.copy(target, backup, StandardCopyOption.REPLACE_EXISTING);
-				} catch (IOException backupError) { System.err.println("Could not refresh world backup: " + backupError); }
-			}
+			if (Files.isRegularFile(target)) refreshBackup(target);
 			try { Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE); }
 			catch (AtomicMoveNotSupportedException ex) { Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING); }
 		} catch (Exception e) {
@@ -6552,6 +6800,7 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		evictCache();
 		prunePending(chunkOf(x), chunkOf(y), chunkOf(z), true);
 		if (full) {
+			CaveFog.clear();
 			BASIN_CACHE.clear();
 			MENGER_SITES.clear();
 			PYRAMIDS.clear();
@@ -6571,13 +6820,20 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		if (lo != null && CAND.length > 2L * lo.length) CAND = new long[0];
 	}
 
-	/** Asks the JVM to collect and shrink the heap. Throttled to once per 10 s and run off the main thread. */
 	static void requestHeapTrim() {
 		final long now = System.currentTimeMillis();
 		if (now - lastHeapTrim < 10_000L || !heapTrimBusy.compareAndSet(false, true)) return;
 		lastHeapTrim = now;
 		Thread.ofPlatform().name("nexus-heap-trim").daemon().start(() -> {
-			try { System.gc(); } finally { heapTrimBusy.set(false); }
+			try {
+				final long giveUp = System.currentTimeMillis() + 30_000L;
+				while (!(mainMenu || paused || dialogOpen || titleIdle)) {
+					if (System.currentTimeMillis() > giveUp) return;
+					Thread.sleep(500);
+				}
+				System.gc();
+			} catch (InterruptedException _) { Thread.currentThread().interrupt(); }
+			finally { heapTrimBusy.set(false); }
 		});
 	}
 
@@ -6876,10 +7132,9 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 
 	@Override
 	public void mouseEntered(MouseEvent e) {
-		if (!paused && !dead) center();
+		if (!paused && !dead && !mainMenu && !dialogOpen && !modifyUi) center();
 		inside = true;
-		if (frame.isFocused() && !lock)
-			mouse();
+		if (frame.isFocused() && !lock) mouse();
 	}
 
 	@Override
@@ -6929,14 +7184,20 @@ public class Nexus extends JPanel implements KeyListener, MouseListener, MouseMo
 		}
 	}
 
+	private void scrollWorldList(MouseWheelEvent e) {
+		final int gui = frontGuiScale(), listH = Math.min(238 * gui, Math.max(82 * gui, height / 4 + 10 * gui));
+		final int visible = Math.max(1, (listH - 12 * gui) / (36 * gui));
+		final int maxScroll = Math.max(0, discoverSharedWorlds().size() - visible);
+		final int delta = Integer.signum(e.getWheelRotation()) * Math.max(1, Math.abs(e.getWheelRotation()));
+		worldScroll = Math.clamp(worldScroll + delta, 0, maxScroll);
+		repaint();
+	}
+
 	@Override
 	public void mouseWheelMoved(MouseWheelEvent e) {
 		if (mainMenu && frontScreen == 1) {
-			int gui=frontGuiScale(), listH=Math.min(238*gui,Math.max(82*gui,height/4+10*gui));
-			int visible=Math.max(1,(listH-12*gui)/(36*gui));
-			int count=discoverSharedWorlds().size();
-			worldScroll=Math.max(0, Math.clamp(count - visible, 0, worldScroll + Integer.signum(e.getWheelRotation()) * Math.max(1, Math.abs(e.getWheelRotation()))));
-			repaint(); return;
+			scrollWorldList(e);
+			return;
 		}
 		if (dead) return;
 		int len = hotbar.length;
@@ -7072,6 +7333,15 @@ final class GpuTracer {
 	private boolean lightDirty = true;
 	private volatile boolean lightOk;
 	private long lastLightBuild;
+	private static final ExecutorService lightPool = Executors.newFixedThreadPool(Math.clamp(THREADS / 4, 2, 3),
+			Thread.ofPlatform().name("nexus-gpu-light-", 0).daemon().priority(Thread.NORM_PRIORITY - 1).factory());
+	private record LightReq(int slot, int id, Future<ChunkLights> f) { }
+	private final ArrayDeque<LightReq> lightReqs = new ArrayDeque<>();
+	private int[] lReq = new int[0];
+	private int reqCounter;
+	private record LightTable(int M, int total, long[] key, int[] tabI, float[] cl) { }
+	private Future<LightTable> lightJob;
+	private volatile boolean closed;
 
 	private static final Linker LINKER = Linker.nativeLinker();
 	private static SymbolLookup lib;
@@ -7169,10 +7439,9 @@ final class GpuTracer {
 	}
 
 	private static boolean fullEligible() {
-		if (Render.cave > 0.002) return false;
 		if (Render.cls || !(blockLightingEnabled && lightQ >= 1)) return true;
 		final GpuTracer t = inst;
-		return (GPU_BLOCK_LIGHT && t != null && t.lightOk) || !glowLoaded();
+		return (GPU_BLOCK_LIGHT && t != null && t.lightReady()) || !glowLoaded();
 	}
 
 	// ---------- instance ----------
@@ -7184,13 +7453,13 @@ final class GpuTracer {
 	private final MemorySegment ctx;
 	private final MemorySegment queue;
 	private final MemorySegment kernel;
-	private MemorySegment bKey, bInfo, bAtlas, bCrack, bOut, bOpq, bGlow, bGrid, bIp, bLp, bFp;
-	private final MemorySegment gws, lws;
-	private MemorySegment gof;
+	private MemorySegment bKey, bInfo, bAtlas, bCrack, bOut, bOpq, bGlow, bGrid, bIp, bLp, bFp, bCave;
+	private long caveCap;
+	private CaveFog.Field caveSeen;
+	private int caveN;
+	private final MemorySegment gws, lws, gof;
 	private boolean integrated;
-	private double msPerRow = 0.5;
 	private final int bandMax;
-	private static final double BAND_TARGET_MS = 20;
 	static volatile double gpuMs; static volatile int gpuBands;
 	private final int[] ip = new int[384];
 	private final long[] lp = new long[6];
@@ -7201,7 +7470,8 @@ final class GpuTracer {
 	private Octree[] lData;
 	private boolean[] lPresent;
 	private boolean argsDirty = true;
-	private MemorySegment progMain, progGen;
+	private final MemorySegment progMain;
+    private MemorySegment progGen;
 
 	// biome lattice (16-block spacing): toroidal cache of noise samples + the camera-relative copy sent to the GPU
 	private long[] tagX = new long[0], tagZ = new long[0];
@@ -7282,6 +7552,7 @@ final class GpuTracer {
 		bOpq = buf(4L, 256); bGlow = buf(4L, 256 * 4L);
 		bIp = buf(4L, 384 * 4L); bLp = buf(4L, 6 * 8L); bFp = buf(4L, 48 * 4L);
 		bLtab = buf(4L, 24); bLtabI = buf(4L, 8); bLcl = buf(4L, 24);
+		bCave = buf(4L, 64);
 		gws = own.allocate(16, 8); lws = own.allocate(16, 8); gof = own.allocate(16, 8);
 		lws.setAtIndex(J, 0, 8); lws.setAtIndex(J, 1, 8);
 		final byte[] k = new byte[BREAK_STAGES * 256];
@@ -7295,24 +7566,43 @@ final class GpuTracer {
 		publishMemory();
 	}
 
+	// GpuTracer: replace the BAND_TARGET_MS and bandPx fields with these
+	private static final double BAND_TARGET_MS = 4;
+	private static final long BAND_START_PX = 8192;
+	private double msPerPx; // worst recent cost per pixel, decays slowly
+
 	private void dispatch(int W, int H) throws Throwable {
 		final long gw = ((W + 7) / 8) * 8L, gh = ((H + 7) / 8) * 8L;
-		gws.setAtIndex(J, 0, gw);
-		gof.setAtIndex(J, 0, 0L);
+		final long maxPx = integrated ? (1L << 16) : (1L << 18);
 		final long t00 = System.nanoTime();
+		long cur = BAND_START_PX;
+		if (msPerPx > 0) cur = Math.clamp(Math.min(cur, (long) (BAND_TARGET_MS / msPerPx)), 64L, maxPx);
 		int bands = 0;
-		for (long y0 = 0; y0 < gh;) {
-			final long want = (long) (BAND_TARGET_MS / Math.max(1e-4, msPerRow)) / 8 * 8;
-			final long rows = Math.clamp(want, 8L, Math.min(bandMax, gh - y0)); // multiple of 8
-			gws.setAtIndex(J, 1, rows);
-			gof.setAtIndex(J, 1, y0);
+		long y0 = 0, x0 = 0;
+		while (y0 < gh) {
+			final long rows, cols;
+			if (x0 > 0 || cur < gw * 8) {
+				rows = 8;
+				cols = Math.clamp(cur / 64 * 8, 8L, gw - x0);
+			} else {
+				rows = Math.clamp(cur / gw / 8 * 8, 8L, Math.min(bandMax, gh - y0));
+				cols = gw;
+			}
+			gws.setAtIndex(J, 0, cols); gws.setAtIndex(J, 1, rows);
+			gof.setAtIndex(J, 0, x0);   gof.setAtIndex(J, 1, y0);
 			final long t0 = System.nanoTime();
 			ok((int) enqueue.invoke(queue, kernel, 2, gof, gws, lws, 0, MemorySegment.NULL, MemorySegment.NULL), "clEnqueueNDRangeKernel");
 			ok((int) finish.invoke(queue), "clFinish");
-			final double ms = (System.nanoTime() - t0) / 1e6, per = ms / rows;
-			if (ms > 400 && rows <= 8) throw new IllegalStateException("GPU too slow on this device (" + (int) ms + " ms for 8 rows)");
-			msPerRow = per > msPerRow ? per : 0.8 * msPerRow + 0.2 * per;
-			y0 += rows; bands++;
+			final double ms = (System.nanoTime() - t0) / 1e6;
+			final long px = cols * rows;
+			// A tiny band that is still extremely slow means this device can't run the renderer: bail out to the CPU.
+			if (ms > 750 && px <= 256) throw new IllegalStateException("GPU too slow on this device (" + (int) ms + " ms for " + px + " px)");
+			msPerPx = Math.max(ms / px, msPerPx * 0.97);
+			// grow at most 1.5x per band and never beyond what the measured worst-case cost allows
+			cur = Math.clamp(Math.min((long) (BAND_TARGET_MS / msPerPx), cur + cur / 2), 64L, maxPx);
+			bands++;
+			x0 += cols;
+			if (x0 >= gw) { x0 = 0; y0 += rows; }
 		}
 		gpuMs = (System.nanoTime() - t00) / 1e6; gpuBands = bands;
 	}
@@ -7442,6 +7732,10 @@ final class GpuTracer {
 	}
 
 	private void resetSlots(int s, int w) throws Throwable {
+		if (lightJob != null) { lightJob.cancel(true); lightJob = null; }
+		for (LightReq r : lightReqs) r.f().cancel(true);
+		lightReqs.clear();
+		lReq = new int[s];
 		slots = s; ringW = w; needFull = true; syncCursor = 0;
 		nodePool.reset(); cellPool.reset();
 		nOff = new int[s]; nCap = new int[s]; nPg = new int[s];
@@ -7541,20 +7835,33 @@ final class GpuTracer {
 
 	private void updateLight(int s, boolean p, Octree o) {
 		if (!GPU_BLOCK_LIGHT) return;
-		final ChunkLights cur = lcache[s];
-		if (!p || o == null || !o.mayGlow()) { if (cur != null) { lcache[s] = null; lightDirty = true; } return; }
+		final int id = lReq[s] = ++reqCounter;
+		if (!p || o == null || !o.mayGlow()) {
+			if (lcache[s] != null) { lcache[s] = null; lightDirty = true; }
+			return;
+		}
 		final World wd = world;
-		final ChunkLights nl = buildLights(wd.kx[s], wd.ky[s], wd.kz[s], o);
-		lcache[s] = nl.n() == 0 ? null : nl;
-		if (cur != null || nl.n() != 0) lightDirty = true;
+		final long kx = wd.kx[s], ky = wd.ky[s], kz = wd.kz[s];
+		final Octree snap = o.snapshot();
+		lightReqs.add(new LightReq(s, id, lightPool.submit(() -> buildLights(kx, ky, kz, snap))));
 	}
 
+	private static final AtomicReferenceArray<float[]> SHARED_LIGHT = new AtomicReferenceArray<>(256);
+
 	private static ChunkLights buildLights(long kx, long ky, long kz, Octree o) {
-		final long bx = kx << SHIFT, by = ky << SHIFT, bz = kz << SHIFT;
+		float[] c;
+		if (o.shared) { // uniform chunk: the local cluster list only depends on the block id
+			final int id = o.root & 0xFF;
+			c = SHARED_LIGHT.get(id);
+			if (c == null) SHARED_LIGHT.set(id, c = lightClusters(o));
+		} else c = lightClusters(o);
+		return new ChunkLights(kx, ky, kz, c, c.length / 6);
+	}
+
+	private static float[] lightClusters(Octree o) {
 		final HashMap<Integer, double[]> acc = new HashMap<>();
-		o.forEachGlow(bx, by, bz, bx, by, bz, bx + SIZE - 1, by + SIZE - 1, bz + SIZE - 1, (id, wx0, wy0, wz0, wx1, wy1, wz1) -> {
-			final int ax = (int) (wx0 - bx), ay = (int) (wy0 - by), az = (int) (wz0 - bz);
-			final int ex = (int) (wx1 - bx), ey = (int) (wy1 - by), ez = (int) (wz1 - bz);
+		o.forEachGlow(0, 0, 0, 0, 0, 0, SIZE - 1, SIZE - 1, SIZE - 1, (id, wx0, wy0, wz0, wx1, wy1, wz1) -> {
+			final int ax = (int) wx0, ay = (int) wy0, az = (int) wz0, ex = (int) wx1, ey = (int) wy1, ez = (int) wz1;
 			final long vol = (long) (ex - ax + 1) * (ey - ay + 1) * (ez - az + 1);
 			final int k = vol > 512 ? 3 : 2, m = (1 << k) - 1;
 			final double unit = GLOW[id] * Render.BLOCK_LIGHT_GAIN;
@@ -7581,7 +7888,7 @@ final class GpuTracer {
 			c[i + 3] = (float) a[4]; c[i + 4] = (float) a[5]; c[i + 5] = (float) a[6];
 			i += 6;
 		}
-		return new ChunkLights(kx, ky, kz, c, acc.size());
+		return c;
 	}
 
 	/** Must match hashSlot in the kernel exactly. */
@@ -7599,39 +7906,95 @@ final class GpuTracer {
 		}
 	}
 
-	private void rebuildLights() throws Throwable {
+	private void pumpLights(long now) throws Throwable {
+		for (Iterator<LightReq> it = lightReqs.iterator(); it.hasNext();) {
+			final LightReq r = it.next();
+			if (!r.f().isDone()) continue;
+			it.remove();
+			if (r.slot() >= lReq.length || lReq[r.slot()] != r.id()) continue;
+			try {
+				final ChunkLights nl = r.f().get();
+				lcache[r.slot()] = nl.n() == 0 ? null : nl;
+				lightDirty = true;
+			} catch (Exception _) { }
+		}
+		if (lightJob != null && lightJob.isDone()) {
+			final Future<LightTable> f = lightJob;
+			lightJob = null;
+			try { applyLights(f.get()); }
+			catch (Exception e) { lightDirty = true; lastLightBuild = now; }
+		}
+		if (lightJob == null && lightDirty && now - lastLightBuild >= (lightOk ? 100 : 16)) {
+			lightDirty = false;
+			lastLightBuild = now;
+			final ChunkLights[] snap = lcache.clone();
+			final long ccx = chunkOf(viewX), ccy = chunkOf(viewY), ccz = chunkOf(viewZ);
+			lightJob = lightPool.submit(() -> computeLights(snap, ccx, ccy, ccz));
+		}
+	}
+
+	/** True while a GPU light table exists or is on its way, so the frame stays on the GPU instead of falling back to CPU lighting. */
+	boolean lightReady() { return lightOk || lightJob != null || !lightReqs.isEmpty(); }
+
+	private static LightTable computeLights(ChunkLights[] snap, long ccx, long ccy, long ccz) {
 		int total = 0, chunks = 0;
-		for (ChunkLights c : lcache) if (c != null) { total += c.n(); chunks++; }
-		lightDirty = false;
-		if (total > LC_MAX_CLUSTERS) { lightOk = false; ltabMask = -1; return; } // too many: the CPU path lights instead
-		if (total == 0) { ltabMask = -1; lightOk = true; return; }
+		for (ChunkLights c : snap) if (c != null) { total += c.n(); chunks++; }
+		if (total > LC_MAX_CLUSTERS) { // keep the emitters nearest the camera instead of dropping all light
+			final double[] d2 = new double[snap.length];
+			final Integer[] order = new Integer[chunks];
+			int k = 0;
+			for (int i = 0; i < snap.length; i++) {
+				if (snap[i] == null) continue;
+				final double dx = snap[i].kx() - ccx, dy = snap[i].ky() - ccy, dz = snap[i].kz() - ccz;
+				d2[i] = dx * dx + dy * dy + dz * dz;
+				order[k++] = i;
+			}
+			Arrays.sort(order, Comparator.comparingDouble(idx -> d2[idx]));
+			final ChunkLights[] kept = new ChunkLights[snap.length];
+			total = 0; chunks = 0;
+			for (int i : order) {
+				if (total + snap[i].n() > LC_MAX_CLUSTERS) break;
+				kept[i] = snap[i]; total += snap[i].n(); chunks++;
+			}
+			snap = kept;
+		}
+		if (total == 0) return new LightTable(0, 0, null, null, null);
 		int M = 16;
-		while (M < chunks * 16) M <<= 1; // each chunk touches at most 8 coarse cells: load <= 0.5
+		while (M < chunks * 16) M <<= 1;
 		final long[] key = new long[3 * M];
 		final int[] cnt = new int[M], start = new int[M], cur = new int[M], at = new int[total];
 		int ci = 0;
-		for (ChunkLights c : lcache) if (c != null) for (int i = 0; i < c.n(); i++) at[ci++] = lightSlot(key, cnt, M - 1, c, i);
+		for (ChunkLights c : snap) if (c != null) for (int i = 0; i < c.n(); i++) at[ci++] = lightSlot(key, cnt, M - 1, c, i);
 		int run = 0;
 		for (int i = 0; i < M; i++) { start[i] = cnt[i] == 0 ? -1 : run; run += cnt[i]; }
 		final float[] cl = new float[total * 6];
 		ci = 0;
-		for (ChunkLights c : lcache) {
+		for (ChunkLights c : snap) {
 			if (c == null) continue;
 			final float[] d = c.c();
 			for (int i = 0; i < c.n(); i++) {
 				final int sl = at[ci++], dst = (start[sl] + cur[sl]++) * 6, o = i * 6;
-				for (int k = 0; k < 3; k++) cl[dst + k] = d[o + k] >= 32f ? d[o + k] - 32f : d[o + k]; // offset inside its 32-block cell
+				for (int k = 0; k < 3; k++) cl[dst + k] = d[o + k] >= 32f ? d[o + k] - 32f : d[o + k];
 				cl[dst + 3] = d[o + 3]; cl[dst + 4] = d[o + 4]; cl[dst + 5] = d[o + 5];
 			}
 		}
 		final int[] tabI = new int[2 * M];
 		for (int i = 0; i < M; i++) { tabI[2 * i] = start[i]; tabI[2 * i + 1] = cnt[i]; }
+		return new LightTable(M, total, key, tabI, cl);
+	}
+
+	/** Render thread. */
+	private void applyLights(LightTable t) throws Throwable {
+		if (t == null) return;
+		if (t.total() == 0) { ltabMask = -1; lightOk = true; return; }
+		final int M = t.M(), total = t.total();
 		if (ltabCap < M || ltabCap > 8L * M) { free(bLtab); free(bLtabI); bLtab = buf(4L, 24L * M); bLtabI = buf(4L, 8L * M); ltabCap = M; argsDirty = true; }
 		if (lclCap < total || lclCap > 8L * total) { free(bLcl); bLcl = buf(4L, 24L * total); lclCap = total; argsDirty = true; }
-		up(bLtab, 0, key, 0, 3 * M, J);
-		up(bLtabI, 0, tabI, 0, 2 * M, I);
-		up(bLcl, 0, cl, 0, 6 * total, ValueLayout.JAVA_FLOAT);
-		ltabMask = M - 1; lightOk = true;
+		up(bLtab, 0, t.key(), 0, 3 * M, J);
+		up(bLtabI, 0, t.tabI(), 0, 2 * M, I);
+		up(bLcl, 0, t.cl(), 0, 6 * total, ValueLayout.JAVA_FLOAT);
+		ltabMask = M - 1;
+		lightOk = true;
 	}
 
 	private static volatile boolean trimRequested;
@@ -7653,21 +8016,31 @@ final class GpuTracer {
 
 	private boolean shouldCompact(long now) {
 		final long res = nodePool.reserved() + cellPool.reserved(), liv = nodePool.liveBytes() + cellPool.liveBytes();
-		return res >= COMPACT_MIN && liv * 2 < res && now - lastCompact >= COMPACT_GAP;
+		return res >= (512L << 20) && liv * 4 < res && now - lastCompact >= 120_000L;
 	}
 
-	/** Frees every page and marks all slots for a fresh, tightly packed upload. */
 	private void compact() throws Throwable {
 		nodePool.releaseAll(); cellPool.releaseAll();
-		if (slots >= 0) resetSlots(slots, ringW);
+		if (slots < 0) return;
+		final ChunkLights[] keep = lcache;
+		final boolean ok = lightOk;
+		final int mask = ltabMask;
+		resetSlots(slots, ringW);
+		lcache = keep; lightOk = ok; ltabMask = mask;
 	}
 
-	/** Called every frame the GPU renderer is off: gives all chunk memory back once. */
 	static void releaseIdle() {
 		final GpuTracer t = inst;
-		if (t == null || t.idleFreed) return;
-		try { t.compact(); t.trimHostNow(); t.idleFreed = true; t.publishMemory(); }
-		catch (Throwable e) { System.err.println("GPU release failed: " + e); }
+		if (t != null) {
+			inst = null;
+			t.genReady = false;
+			try { t.close(); } catch (Throwable e) { System.err.println("GPU release failed: " + e); }
+			for (Octree o : world.data) if (o != null && !o.shared) o.dropCaches();
+			Render.releaseCaches();
+			glowCursor = 0; glowAny = glowAcc = false;
+			requestHeapTrim();
+		}
+		memReserved = memLive = 0;
 	}
 
 	private long fixedBytes() {
@@ -7675,6 +8048,7 @@ final class GpuTracer {
 		if (slots > 0) b += 40L * slots;
 		if (outPixels > 0) b += outPixels * 28L + 64 + ltabCap * 32 + lclCap * 24;
 		b += gridCap * 4L;
+		b += caveCap * 16L;
 		return b;
 	}
 
@@ -7687,12 +8061,14 @@ final class GpuTracer {
 
 	private void releaseDeviceMemory() throws Throwable {
 		synchronized (genLock) {
+			try { finish.invoke(queue); finish.invoke(genQueue); } catch (Throwable _) { }
 			genReady = false;
 			nodePool.releaseAll(); cellPool.releaseAll();
 			free(bKey); free(bInfo); free(bAtlas); free(bCrack); free(bOut); free(bOpq); free(bGlow); free(bGrid);
 			free(bIp); free(bLp); free(bFp); free(dummy); free(gLift); free(gDens); free(gCaveA); free(gCaveB);
-			free(bLtab); free(bLtabI); free(bLcl);
+			free(bLtab); free(bLtabI); free(bLcl); free(bCave);
 			bKey = bInfo = bAtlas = bCrack = bOut = bOpq = bGlow = bGrid = bIp = bLp = bFp = dummy = gLift = gDens = gCaveA = gCaveB = bLtab = bLtabI = bLcl = null;
+			bCave = null; caveCap = 0; caveSeen = null; caveN = 0;
 			ltabCap = lclCap = 0; ltabMask = -1; lightOk = false;
 			slots = -1; outPixels = -1; gridCap = 0; genBytes = 0;
 			memReserved = memLive = 0;
@@ -7700,14 +8076,14 @@ final class GpuTracer {
 	}
 
 	private void bindArgs() throws Throwable {
-		final MemorySegment[] a = new MemorySegment[30];
+		final MemorySegment[] a = new MemorySegment[31];
 		for (byte i = 0; i < 8; i++) {
 			a[i] = i < nodePool.pages && nodePool.bufs[i] != null ? nodePool.bufs[i] : dummy;
 			a[8 + i] = i < cellPool.pages && cellPool.bufs[i] != null ? cellPool.bufs[i] : dummy;
 		}
 		a[16] = bKey; a[17] = bInfo; a[18] = bAtlas; a[19] = bCrack; a[20] = bIp; a[21] = bLp;
 		a[22] = bFp; a[23] = bOut; a[24] = bOpq; a[25] = bGlow;
-		a[26] = bGrid; a[27] = bLtab; a[28] = bLtabI; a[29] = bLcl;
+		a[26] = bGrid; a[27] = bLtab; a[28] = bLtabI; a[29] = bLcl; a[30] = bCave;
 		try (Arena t = Arena.ofConfined()) {
 			final MemorySegment h = t.allocate(P);
 			for (int i = 0; i < a.length; i++) {
@@ -7719,6 +8095,10 @@ final class GpuTracer {
 	}
 
 	void close() {
+		closed = true;
+		if (lightJob != null) { lightJob.cancel(true); lightJob = null; }
+		for (LightReq r : lightReqs) r.f().cancel(true);
+		lightReqs.clear();
 		try { releaseDeviceMemory(); } catch (Throwable _) { }
 		try { stageArena.close(); } catch (RuntimeException _) { }
 		try { own.close(); } catch (RuntimeException _) { }
@@ -7837,10 +8217,20 @@ final class GpuTracer {
 				if (!s.valid) continue;
 				final long x0 = s.ax - s.size / 2 - pbx, z0 = s.az - s.size / 2 - pbz, top = s.surface - s.size + 1 - pby, bot = s.surface - pby;
 				if (!fits(x0) || !fits(z0) || !fits(top) || !fits(bot)) continue;
-				final int o = 40 + 5 * n++;
+				final int o = 48 + 5 * n++;
 				ip[o] = (int) x0; ip[o + 1] = (int) z0; ip[o + 2] = s.size; ip[o + 3] = (int) top; ip[o + 4] = (int) bot;
 			}
 		return n;
+	}
+
+	private void syncCave(CaveFog.Field cf) throws Throwable {
+		if (cf == caveSeen) return;
+		caveSeen = cf;
+		if (cf == null) { caveN = 0; return; }
+		final long cells = (long) cf.n * cf.n * cf.n;
+		if (caveCap < cells || caveCap > 4 * cells) { free(bCave); bCave = buf(4L, cells * 16); caveCap = cells; argsDirty = true; }
+		up(bCave, 0, cf.v, 0, cf.v.length, ValueLayout.JAVA_FLOAT);
+		caveN = cf.n;
 	}
 
 	// ---------- one frame ----------
@@ -7860,7 +8250,7 @@ final class GpuTracer {
 		}
 		syncAtlas();
 		final long nowMs = System.currentTimeMillis();
-		if (GPU_BLOCK_LIGHT && lightDirty && (!lightOk || nowMs - lastLightBuild >= 100)) { rebuildLights(); lastLightBuild = nowMs; }
+		if (GPU_BLOCK_LIGHT) pumpLights(nowMs);
 
 		final World wd = world;
 		final long pbx = Render.pbx, pby = Render.pby, pbz = Render.pbz;
@@ -7868,6 +8258,7 @@ final class GpuTracer {
 		if (full) syncGrid(pbx, pbz, R, N);
 		if (px != outPixels) { free(bOut); bOut = buf(1L, px * 28L + 64); outPixels = px; argsDirty = true; }
 		if (bGrid == null) { bGrid = buf(4L, 16); argsDirty = true; }
+		if (full) syncCave(CaveFog.field);
 		if (argsDirty) bindArgs();
 
 		ip[0] = wd.w; ip[1] = W; ip[2] = H;
@@ -7893,6 +8284,12 @@ final class GpuTracer {
 		final boolean lightOn = GPU_BLOCK_LIGHT && lightOk && ltabMask >= 0 && blockLightingEnabled && lightQ >= 1 && !Render.cls;
 		ip[32] = (int) (pbx & 31); ip[33] = (int) (pby & 31); ip[34] = (int) (pbz & 31);
 		ip[35] = lightOn ? 1 : 0; ip[36] = Nexus.blockLightDensity; ip[37] = ltabMask;
+		final CaveFog.Field cf = caveSeen;
+		final boolean caveOn = full && cf != null && Render.cave > 0.002 && fits(cf.x0 - pbx) && fits(cf.y0 - pby) && fits(cf.z0 - pbz);
+		ip[39] = caveOn ? cf.n : 0;
+		ip[40] = caveOn ? (int) (cf.x0 - pbx) : 0;
+		ip[41] = caveOn ? (int) (cf.y0 - pby) : 0;
+		ip[42] = caveOn ? (int) (cf.z0 - pbz) : 0;
 		lp[0] = pbx >> SHIFT; lp[1] = pby >> SHIFT; lp[2] = pbz >> SHIFT;
 		lp[3] = pbx >> 5; lp[4] = pby >> 5; lp[5] = pbz >> 5;
 		fp[0] = (float) Render.rpx; fp[1] = (float) Render.rpy; fp[2] = (float) Render.rpz;
@@ -7909,7 +8306,7 @@ final class GpuTracer {
 		fp[32] = (float) Render.lx; fp[33] = (float) Render.ly; fp[34] = (float) Render.lz;
 		fp[35] = (float) Render.fLR; fp[36] = (float) Render.fLG; fp[37] = (float) Render.fLB;
 		fp[38] = (float) red; fp[39] = (float) green; fp[40] = (float) blue;
-		up(bIp, 0, ip, 0, 40 + 5 * ip[30], I);
+		up(bIp, 0, ip, 0, 48 + 5 * ip[30], I);
 		up(bLp, 0, lp, 0, 6, J);
 		up(bFp, 0, fp, 0, 48, ValueLayout.JAVA_FLOAT);
 		dispatch(W, H);
@@ -7993,6 +8390,7 @@ final class GpuTracer {
 	private boolean densityOnGpu(float[] g, double[] lift, long bx, long by, long bz) throws Throwable {
 		final int n = CAVE_N, total = n * (n + 2) * n;
 		synchronized (genLock) {
+			if (closed) return false;
 			MemorySegment.copy(lift, 0, hLift, ValueLayout.JAVA_DOUBLE, 0L, n * n);
 			ok((int) writeBuffer.invoke(genQueue, gLift, 1, 0L, (long) n * n * 8, hLift, 0, MemorySegment.NULL, MemorySegment.NULL), "gen write");
 			try (Arena t = Arena.ofConfined()) {
@@ -8010,6 +8408,7 @@ final class GpuTracer {
 	private boolean caveOnGpu(float[] ga, float[] gb, long bx, long by, long bz) throws Throwable {
 		final int total = CAVE_N * CAVE_N * CAVE_N;
 		synchronized (genLock) {
+			if (closed) return false;
 			try (Arena t = Arena.ofConfined()) {
 				argBuf(genCaveK, 0, gCaveA, t); argBuf(genCaveK, 1, gCaveB, t);
 				argLong(genCaveK, 2, bx, t); argLong(genCaveK, 3, by, t); argLong(genCaveK, 4, bz, t);
@@ -8383,8 +8782,22 @@ final class GpuTracer {
 
 		float sst(float a, float b, float x) { const float t = clamp((x - a) / (b - a), 0.0f, 1.0f); return t * t * (3.0f - 2.0f * t); }
 
+		float4 caveAt(float hx, float hy, float hz, __global const int* ip, __global const float4* cg) {
+			const int N = ip[39];
+			const float lim = (float)(N - 1) - 1e-3f;
+			const float tx = clamp((hx - (float)ip[40] - 0.5f) * 0.0625f, 0.0f, lim);
+		 	const float ty = clamp((hy - (float)ip[41] - 0.5f) * 0.0625f, 0.0f, lim);
+			const float tz = clamp((hz - (float)ip[42] - 0.5f) * 0.0625f, 0.0f, lim);
+			const int ix = (int)tx, iy = (int)ty, iz = (int)tz;
+			const float fx = tx - ix, fy = ty - iy, fz = tz - iz;
+			const int b = (iz * N + iy) * N + ix, sy = N, sz = N * N;
+			const float4 c00 = mix(cg[b], cg[b + 1], fx), c10 = mix(cg[b + sy], cg[b + sy + 1], fx);
+			const float4 c01 = mix(cg[b + sz], cg[b + sz + 1], fx), c11 = mix(cg[b + sz + sy], cg[b + sz + sy + 1], fx);
+			return mix(mix(c00, c10, fy), mix(c01, c11, fy), fz);
+		}
+
 		/* Biome fog (rgb + density) from the camera-relative lattice; mirrors Fog.surface(). */
-		float4 fogAt(float hx, float hy, float hz, __global const int* ip, __global const float* fp, __global const float* grid) {
+		float4 fogAt(float hx, float hy, float hz, __global const int* ip, __global const float* fp, __global const float* grid, __global const float4* cg) {
 		  const int N = ip[26], R = ip[27];
 		  const float fxw = floor(hx), fzw = floor(hz);
 		  const int ix = ip[28] + (int)fxw, iz = ip[29] + (int)fzw;
@@ -8395,19 +8808,30 @@ final class GpuTracer {
 		  const float top = a + (b - a) * fx, bot = c + (d - c) * fx, v = top + (bot - top) * fz;
 		  const float dry = 1.0f - sst(0.55f, 0.75f, v), ice = sst(1.75f, 1.95f, v), snow = sst(1.3f, 1.5f, v) * (1.0f - ice);
 		  const float plain = fmax(0.0f, 1.0f - dry - snow - ice);
-		  return (float4)((dry * 0.85f + plain * fp[38] + snow * 0.82f + ice * 0.55f) * fp[35],
-		                  (dry * 0.72f + plain * fp[39] + snow * 0.90f + ice * 0.82f) * fp[36],
-		                  (dry * 0.48f + plain * fp[40] + snow * 0.97f + ice * 1.00f) * fp[37],
-		                  dry + plain + snow * 1.3f + ice * 1.7f);
+		  float4 res = (float4)((dry * 0.85f + plain * fp[38] + snow * 0.82f + ice * 0.55f) * fp[35],
+			                    (dry * 0.72f + plain * fp[39] + snow * 0.90f + ice * 0.82f) * fp[36],
+			                    (dry * 0.48f + plain * fp[40] + snow * 0.97f + ice * 1.00f) * fp[37],
+			                    dry + plain + snow * 1.3f + ice * 1.7f);
+		  const float cv = fp[19];
+		  if (cv > 0.002f) {
+		  	const float4 k = ip[39] > 0 ? caveAt(hx, hy, hz, ip, cg) : (float4)(0.03f, 0.04f, 0.06f, 2.4f);
+			res += (k - res) * cv;
+		  }
+		  return res;
 		}
 
 		int inSponge(int bx, int by, int bz, __global const int* ip) {
 		  const int n = ip[30];
 		  for (int i = 0; i < n; i++) {
-		    const int o = 40 + 5 * i, x0 = ip[o], z0 = ip[o + 1], sz = ip[o + 2], ty = ip[o + 3], sf = ip[o + 4];
+		    const int o = 48 + 5 * i, x0 = ip[o], z0 = ip[o + 1], sz = ip[o + 2], ty = ip[o + 3], sf = ip[o + 4];
 		    if (bx >= x0 && bx < x0 + sz && bz >= z0 && bz < z0 + sz && by >= ty && by <= sf) return 1;
 		  }
 		  return 0;
+		}
+
+		float faceShade(int axis, int sg) {
+		  const int i = axis * 2 + (sg > 0 ? 1 : 0);
+		  return i == 0 ? 0.80f : i == 1 ? 0.88f : i == 2 ? 1.0f : i == 3 ? 0.68f : i == 4 ? 0.74f : 0.94f;
 		}
 
 		int pack3(float3 c) {
@@ -8487,7 +8911,7 @@ final class GpuTracer {
 			                      __global const long* skey, __global const int* sinfo, __global const int* atlas, __global const uchar* crack,
 			                      __global const int* ip, __global const long* lp, __global const float* fp, __global int* out,
 			                      __global const uchar* opq, __global const float* glow, __global const float* grid,
-			                      __global const long* ltab, __global const int* ltabI, __global const float* lcl) {
+			                      __global const long* ltab, __global const int* ltabI, __global const float* lcl, __global const float4* cg) {
 			    Pg pgs;
 			    pgs.n0 = n0; pgs.n1 = n1; pgs.n2 = n2; pgs.n3 = n3; pgs.n4 = n4; pgs.n5 = n5; pgs.n6 = n6; pgs.n7 = n7;
 			    pgs.c0 = c0; pgs.c1 = c1; pgs.c2 = c2; pgs.c3 = c3; pgs.c4 = c4; pgs.c5 = c5; pgs.c6 = c6; pgs.c7 = c7;
@@ -8528,7 +8952,7 @@ final class GpuTracer {
 			    float ft = 0.0f;
 			    int nearF = 0, porous = 0;
 			    if (full) {
-			      fv = fogAt(h.hx, h.hy, h.hz, ip, fp, grid);
+			      fv = fogAt(h.hx, h.hy, h.hz, ip, fp, grid, cg);
 			      ft = fmin(1.0f, h.t * fv.w / fp[16]);
 			      nearF = ft < 0.97f;
 			      porous = nearF && inSponge(h.bx, h.by, h.bz, ip);
@@ -8538,7 +8962,7 @@ final class GpuTracer {
 			      wantSh = (ip[21] & 1) && sunDot > 0.02f;
 			      wantAo = (ip[21] & 2) && opq[h.id] && d2 <= 262144.0f;
 			    } else {
-			      wantSh = !cls && nearF && !porous && sunDot > 0.02f;
+			      wantSh = !cls && nearF && !porous && sunDot > 0.02f && fp[19] <= 0.5f;
 			      wantAo = nearF && !porous && ip[25] && fp[18] > 0.0f && opq[h.id] && d2 <= 262144.0f;
 			    }
 			    int r = 0; float ao = 1.0f;
@@ -8564,18 +8988,24 @@ final class GpuTracer {
 			    if (blOn && nearF && !porous && ft < 0.92f) bl = blockLightAt(&h, sg, ip, fp, lp, ltab, ltabI, lcl);
 			    float3 res;
 			    if (cls) {
-			      if (porous) res = base * (0.78f * (1.0f - ft)) + fc * ft;
+			      if (porous) res = base * (0.78f * faceShade(h.axis, sg) * (1.0f - ft)) + fc * ft;
 			      else res = base * ((255 - ((h.axis + 2) % 3) * 50) / 255.0f * (1.0f - ft) * aoS) + fc * ft;
 			    } else if (!nearF) {
 			      res = base * (ambC * 0.55f + gl) * (1.0f - ft) + fc * ft;
 			    } else if (porous) {
 			      const float day = sst(-0.1f, 0.4f, -fp[33]) * (1.0f - fp[19]), dim = 1.0f - 0.6f * fp[19];
-			      res = base * (ambC * dim + sunC * (0.55f * day) + gl) * (1.0f - ft) + fc * ft;
+			      res = base * ((ambC * dim + sunC * (0.55f * day)) * faceShade(h.axis, sg) + gl) * (1.0f - ft) + fc * ft;
 			    } else {
-			      const float sun = (wantSh && (r & 1)) ? 0.0f : fmax(0.0f, sunDot);
+			      const float cv = fp[19];
+			      const float sunV = (cv > 0.5f || (wantSh && (r & 1))) ? 0.0f : fmax(0.0f, sunDot);
+			      const float skyO = cv > 0.5f ? 0.0f : 1.0f;
+			      const float shade = fmax(cv, 0.35f * (1.0f - sst(0.0f, 0.85f, skyO)));
+			      const float skyL = fmax(0.78f + (0.035f - 0.78f) * shade, skyO);
+			      const float baseA = 0.18f + (0.045f - 0.18f) * shade;
 			      const float softAO = 1.0f - (1.0f - aoS) * 0.55f;
-			      const float k = sun * 0.55f * (0.78f + 0.22f * softAO);
-			      res = base * (ambC * softAO + sunC * k + bl + gl) * (1.0f - ft) + fc * ft;
+			      const float amb = (baseA + (1.0f - baseA) * skyL) * softAO;
+			      const float k = sunV * 0.55f * (0.78f + 0.22f * softAO);
+			      res = base * (ambC * amb + sunC * k + bl + gl) * (1.0f - ft) + fc * ft;
 			    }
 			    out[gid] = pack3(res);
 			    dep[gid] = h.t;
@@ -8763,9 +9193,9 @@ final class Render implements Callable<Void> {
 		rpx = Nexus.fracOf(Nexus.viewX);
 		rpy = Nexus.fracOf(Nexus.viewY);
 		rpz = Nexus.fracOf(Nexus.viewZ);
-		lx = light.x;
-		ly = light.y;
-		lz = light.z;
+		lx = light[0];
+		ly = light[1];
+		lz = light[2];
 		long tk = Nexus.time;
 		if (SHADOW_REFRESH_TICKS <= 0 || sunTick == Long.MIN_VALUE || tk < sunTick || tk - sunTick >= SHADOW_REFRESH_TICKS) {
 			sunTick = tk;
@@ -8773,9 +9203,9 @@ final class Render implements Callable<Void> {
 			sunVer++;
 			SHADOW.invalidate();
 		}
-		sunR = sunColor.x; sunG = sunColor.y; sunB = sunColor.z;
-		ambR = ambColor.x; ambG = ambColor.y; ambB = ambColor.z;
-		skyR = skyColor.x; skyG = skyColor.y; skyB = skyColor.z;
+		sunR = sunColor[0]; sunG = sunColor[1]; sunB = sunColor[2];
+		ambR = ambColor[0]; ambG = ambColor[1]; ambB = ambColor[2];
+		skyR = skyColor[0]; skyG = skyColor[1]; skyB = skyColor[2];
 		final long nowMs = System.currentTimeMillis();
 		final int wv = Nexus.worldVer, sv = Nexus.streamVer;
 		if (sv != effStream && nowMs - lastStreamTick >= 500) { effStream = sv; lastStreamTick = nowMs; }
@@ -9253,7 +9683,7 @@ final class Render implements Callable<Void> {
 		if (cls) {
 			fLR = fLG = fLB = 1;
 		} else {
-			double lv = 0.12 + 0.88 * smoothstep(-0.2, 0.35, -light.y);
+			double lv = 0.12 + 0.88 * smoothstep(-0.2, 0.35, -light[1]);
 			double m = Math.max(1e-3, Math.max(skyR, Math.max(skyG, skyB)));
 			fLR = lv * (0.65 + 0.35 * skyR / m);
 			fLG = lv * (0.65 + 0.35 * skyG / m);
@@ -9290,6 +9720,9 @@ final class Render implements Callable<Void> {
 		return false;
 	}
 
+	/** Brightness per side of flat-lit (porous) blocks. Keep in sync with faceShade() in the kernel. */
+	static final double[] FACE_SHADE = { 0.80, 0.88, 1.0, 0.68, 0.74, 0.94 };
+
 	private void shadeClassic() {
 		final double hx = hHx, hy = hHy, hz = hHz;
 		final byte axis = hAxis, sign = hSign;
@@ -9299,7 +9732,7 @@ final class Render implements Callable<Void> {
 		final double ft = Math.min(1.0, hT * fog.dens / maxDist);
 
 		if (ft < FOG_SKIP && flatPorousLighting(hBx, hBy, hBz)) {
-			final double flat = 0.78 * (1.0 - ft);
+			final double flat = 0.78 * (1.0 - ft) * FACE_SHADE[axis * 2 + (sign > 0 ? 1 : 0)];
 			hR = hR * flat + fog.r * ft;
 			hG = hG * flat + fog.g * ft;
 			hB = hB * flat + fog.b * ft;
@@ -9355,9 +9788,10 @@ final class Render implements Callable<Void> {
 			// Flat, bright light: ambient plus a fixed share of the sun, faded out at night / underground.
 			final double day = smoothstep(-0.1, 0.4, -ly) * (1.0 - cave);
 			final double dim = 1.0 - 0.6 * cave;
-			final double lr = ambR * dim + sunR * 0.55 * day;
-			final double lg = ambG * dim + sunG * 0.55 * day;
-			final double lb = ambB * dim + sunB * 0.55 * day;
+			final double fs = FACE_SHADE[axis * 2 + (sign > 0 ? 1 : 0)];
+			final double lr = (ambR * dim + sunR * 0.55 * day) * fs;
+			final double lg = (ambG * dim + sunG * 0.55 * day) * fs;
+			final double lb = (ambB * dim + sunB * 0.55 * day) * fs;
 			hR = cr * (lr + gl) * (1 - ft) + fog.r * ft;
 			hG = cg * (lg + gl) * (1 - ft) + fog.g * ft;
 			hB = cb * (lb + gl) * (1 - ft) + fog.b * ft;
@@ -9396,7 +9830,6 @@ final class Render implements Callable<Void> {
 		double base = 0.18 + (CAVE_AMB_BASE - 0.18) * shade;
 		double amb = (base + (1.0 - base) * sky) * softAO;
 		double k = sun * 0.55 * (0.78 + 0.22 * softAO);
-		double lamp = lanternEnabled && !classic ? (1 - sky) * Math.max(0, 1 - t / 18.0) * 0.7 : 0;
 
 		double bR = 0, bG = 0, bB = 0;
 		if (Nexus.blockLightingEnabled && q >= 1 && ft < LIGHT_FOG_SKIP) {
@@ -9404,9 +9837,9 @@ final class Render implements Callable<Void> {
 			bR = blR; bG = blG; bB = blB;
 		}
 
-		double lr = ambR * amb + sunR * k + lamp + bR;
-		double lg = ambG * amb + sunG * k + lamp * 0.8 + bG;
-		double lb = ambB * amb + sunB * k + lamp * 0.5 + bB;
+		double lr = ambR * amb + sunR * k + bR;
+		double lg = ambG * amb + sunG * k + bG;
+		double lb = ambB * amb + sunB * k + bB;
 
 		hR = cr * (lr + gl) * (1 - ft) + fog.r * ft;
 		hG = cg * (lg + gl) * (1 - ft) + fog.g * ft;
@@ -10008,27 +10441,96 @@ final class Particles {
 	}
 }
 
-final class Vec3 {
-	double x, y, z;
+final class CaveFog {
+	static final byte S = 16, MIN_R = 6, MAX_R = 32, HYST = 3;
+	static final double[] DEFAULT = { .03, .04, .06, 2.4 };
 
-	Vec3(double val) {
-		x = y = z = val;
+	static final class Field {
+		final int n; final long gx0, gy0, gz0, x0, y0, z0; final float[] v;
+		Field(int n, long gx0, long gy0, long gz0, float[] v) {
+			this.n = n; this.gx0 = gx0; this.gy0 = gy0; this.gz0 = gz0;
+			x0 = gx0 * S; y0 = gy0 * S; z0 = gz0 * S; this.v = v;
+		}
 	}
 
-	Vec3(double x, double y, double z) {
-		this.x = x;
-		this.y = y;
-		this.z = z;
+	static volatile Field field;
+	private static volatile int gen;
+	private static final AtomicBoolean busy = new AtomicBoolean();
+	private static final ExecutorService pool = Executors.newFixedThreadPool(Math.clamp(THREADS / 2, 1, 4),
+			Thread.ofPlatform().name("nexus-cavefog-", 0).daemon().priority(3).factory());
+
+	static int radiusFor(int dist) { return Math.clamp((int) Math.ceil(dist / 1.6 / S) + 2, MIN_R, MAX_R); }
+
+	static void clear() { gen++; field = null; }
+
+	/** Main thread, cheap. Starts a rebuild only when the camera has drifted from the lattice centre. */
+	static void request(long bx, long by, long bz, int r) {
+		final long gx = Math.floorDiv(bx, (long) S), gy = Math.floorDiv(by, (long) S), gz = Math.floorDiv(bz, (long) S);
+		final Field f = field;
+		if (f != null && f.n == 2 * r + 1 && Math.abs(gx - (f.gx0 + r)) <= HYST
+				&& Math.abs(gy - (f.gy0 + r)) <= HYST && Math.abs(gz - (f.gz0 + r)) <= HYST) return;
+		if (!busy.compareAndSet(false, true)) return;
+		final int g = gen;
+		Thread.ofPlatform().name("nexus-cavefog").daemon().priority(3).start(() -> {
+			try { build(gx, gy, gz, r, g); }
+			catch (Throwable e) { e.printStackTrace(); }
+			finally { busy.set(false); }
+		});
 	}
 
-	static void lerp(Vec3 a, Vec3 b, double t, Vec3 out) {
-		out.x = a.x + (b.x - a.x) * t;
-		out.y = a.y + (b.y - a.y) * t;
-		out.z = a.z + (b.z - a.z) * t;
+	private static void build(long cgx, long cgy, long cgz, int r, int g) throws Exception {
+		final int n = 2 * r + 1;
+		final long ox = cgx - r, oy = cgy - r, oz = cgz - r;
+		final Field old = field;
+		final float[] v = new float[n * n * n * 4];
+		final List<Callable<Void>> jobs = new ArrayList<>(n);
+		for (int z = 0; z < n; z++) {
+			final int zz = z;
+			jobs.add(() -> { slice(v, n, ox, oy, oz, zz, old); return null; });
+		}
+		for (Future<Void> f : pool.invokeAll(jobs)) f.get();
+		if (g == gen) field = new Field(n, ox, oy, oz, v);
 	}
 
-	static Vec3 rgb(int rgb) {
-		return new Vec3(((rgb >> 16) & 0xFF) / 255.0, ((rgb >> 8) & 0xFF) / 255.0, (rgb & 0xFF) / 255.0);
+	/** Nodes that already exist in the previous lattice are copied; only newly covered ones are computed. */
+	private static void slice(float[] v, int n, long ox, long oy, long oz, int z, Field old) {
+		final long gz = oz + z;
+		final int on = old == null ? 0 : old.n;
+		final long lz = old == null ? -1 : gz - old.gz0;
+		for (int y = 0; y < n; y++) {
+			final long gy = oy + y, ly = old == null ? -1 : gy - old.gy0;
+			for (int x = 0; x < n; x++) {
+				final long gx = ox + x, lx = old == null ? -1 : gx - old.gx0;
+				final int o = ((z * n + y) * n + x) << 2;
+				if (old != null && lx >= 0 && lx < on && ly >= 0 && ly < on && lz >= 0 && lz < on)
+					System.arraycopy(old.v, (int) (((lz * on + ly) * on + lx) << 2), v, o, 4);
+				else
+					Fog.caveNode(gx * S, gy * S, gz * S, v, o);
+			}
+		}
+	}
+
+	/** Trilinear lookup, clamped at the lattice edge. Same maths as caveAt() in the kernel. */
+	static double[] sample(long bx, double ox, long by, double oy, long bz, double oz, double[] out) {
+		final Field f = field;
+		if (f == null) { System.arraycopy(DEFAULT, 0, out, 0, 4); return out; }
+		final int n = f.n;
+		final double lim = n - 1 - 1e-3;
+		final double tx = Math.clamp((bx - f.x0 + ox - 0.5) / S, 0.0, lim);
+		final double ty = Math.clamp((by - f.y0 + oy - 0.5) / S, 0.0, lim);
+		final double tz = Math.clamp((bz - f.z0 + oz - 0.5) / S, 0.0, lim);
+		final int ix = (int) tx, iy = (int) ty, iz = (int) tz;
+		final double fx = tx - ix, fy = ty - iy, fz = tz - iz;
+		final float[] v = f.v;
+		Arrays.fill(out, 0.0);
+		for (int dz = 0; dz <= 1; dz++)
+			for (int dy = 0; dy <= 1; dy++)
+				for (int dx = 0; dx <= 1; dx++) {
+					final double w = (dx == 0 ? 1 - fx : fx) * (dy == 0 ? 1 - fy : fy) * (dz == 0 ? 1 - fz : fz);
+					final int o = (((iz + dz) * n + iy + dy) * n + ix + dx) << 2;
+					for (int j = 0; j < 4; j++) out[j] += v[o + j] * w;
+				}
+		return out;
 	}
 }
 
@@ -10038,8 +10540,6 @@ final class Fog {
 	private static final double[][] CAVE = {
 			{ .03, .04, .06, 2.4 }, { .10, .34, .14, 2.0 }, { .45, .65, .90, 1.6 }, { .17, .06, .28, 2.4 }, { .03, .04, .06, 2.4 }, { .10, .08, .07, 2.8 } };
 	private static final int[] ASC = { CB_MOSS, CB_SNOW, CB_BASALT, CB_OBSIDIAN, CB_CRYSTAL }; // ascending priority
-	private static final int N = 8192;
-	private final double[] cache = new double[N * 4];
 	private double sr, sg, sb, sd;
 	private final double[] caveBlend = new double[4];
 	// Per-renderer cache of biome-noise lattice samples. Interpolation keeps the
@@ -10081,20 +10581,22 @@ final class Fog {
 	}
 
 	private double[] cave(long bx, double ox, long by, double oy, long bz, double oz) {
-		double gx = ox - 0.5, gy = oy - 0.5, gz = oz - 0.5;
-		double flx = Math.floor(gx), fly = Math.floor(gy), flz = Math.floor(gz);
-		long x0 = bx + (long) flx, y0 = by + (long) fly, z0 = bz + (long) flz;
-		double fx = gx - flx, fy = gy - fly, fz = gz - flz;
-		double[] out = caveBlend;
-		Arrays.fill(out, 0.0);
-		for (byte dx = 0; dx <= 1; dx++)
-			for (byte dy = 0; dy <= 1; dy++)
-				for (byte dz = 0; dz <= 1; dz++) {
-					double w = (dx == 0 ? 1 - fx : fx) * (dy == 0 ? 1 - fy : fy) * (dz == 0 ? 1 - fz : fz);
-					int o = caveVoxel(x0 + dx, y0 + dy, z0 + dz);
-					for (byte j = 0; j < 4; j++) out[j] += cache[o + j] * w;
-				}
-		return out;
+		return CaveFog.sample(bx, ox, by, oy, bz, oz, caveBlend);
+	}
+
+	/** Fog colour + density of cave voxel (x,y,z). Pure, so any thread may call it. */
+	static void caveNode(long x, long y, long z, float[] dst, int o) {
+		final double[] c = CAVE[0].clone();
+		for (int b : ASC) {
+			final double w = Nexus.zone(b, x, y, z);
+			if (w > 0) for (int j = 0; j < 4; j++) c[j] += (CAVE[b][j] - c[j]) * w;
+		}
+		final int basin = Nexus.basinFogBiome(x, y, z);
+		if (basin != CB_NONE) {
+			final double w = Nexus.basinFogWeight(x, y, z);
+			for (int j = 0; j < 4; j++) c[j] += (CAVE[basin][j] - c[j]) * w;
+		}
+		for (int j = 0; j < 4; j++) dst[o + j] = (float) c[j];
 	}
 
 	/** Fog colour and density at block (bx,by,bz) plus an offset (ox,oy,oz) that may stray outside 0..1. */
@@ -10106,31 +10608,6 @@ final class Fog {
 			double[] k = cave(bx, ox, by, oy, bz, oz);
 			r += (k[0] - r) * c; g += (k[1] - g) * c; b += (k[2] - b) * c; dens += (k[3] - dens) * c;
 		}
-	}
-
-	private final long[] kx = new long[N], ky = new long[N], kz = new long[N];
-	private final boolean[] used = new boolean[N];
-
-	private int caveVoxel(long x, long y, long z) {
-		final int i = (int) (Cache.hash(x, y, z, 0xF06L) >>> 51); // 13 bits
-		final int o = i << 2;
-		if (!used[i] || kx[i] != x || ky[i] != y || kz[i] != z) {
-			used[i] = true; kx[i] = x; ky[i] = y; kz[i] = z;
-			System.arraycopy(CAVE[0], 0, cache, o, 4);
-			for (int b : ASC) {
-				double w = Nexus.zone(b, x, y, z);
-				if (w > 0)
-					for (int j = 0; j < 4; j++)
-						cache[o + j] += (CAVE[b][j] - cache[o + j]) * w;
-			}
-			int basinBiome = Nexus.basinFogBiome(x, y, z);
-			if (basinBiome != CB_NONE) {
-				double w = Nexus.basinFogWeight(x, y, z);
-				for (int j = 0; j < 4; j++)
-					cache[o + j] += (CAVE[basinBiome][j] - cache[o + j]) * w;
-			}
-		}
-		return o;
 	}
 }
 
@@ -10219,6 +10696,16 @@ final class Octree implements Cold {
 
 	void reset() {
 		root = LEAF; top = 0; free = -1; ctop = 0; cfree = -1;
+	}
+
+	/** Plain copy for a worker thread. Unlike frozen(), nothing is cached, so no memory is retained. */
+	Octree snapshot() {
+		if (shared) return this;
+		Octree o = new Octree(0);
+		o.root = root; o.top = top; o.ctop = ctop;
+		o.n = Arrays.copyOf(n, top);
+		o.cells = ctop == 0 ? EMPTY_L : Arrays.copyOf(cells, ctop);
+		return o;
 	}
 
 	/** Block at local coordinates (0..63). */
@@ -10704,10 +11191,6 @@ final class SplitDecimal implements Comparable<SplitDecimal> {
 	}
 }
 
-/**
- * Activator block, 3x3x3 condensing, crafting structure + recipes, crystal items and
- * the permanent upgrades (extra health, mining haste) that are saved in NXS9.
- */
 final class Activator {
 	private Activator() {}
 
@@ -11002,6 +11485,22 @@ final class Activator {
 						break;
 					}
 				if (ok) { Craft c = new Craft(); Arrays.fill(c.out, DYNAMITE); c.name = "27 Dynamite"; return c; }
+			}
+		}
+		// 27 dynamite -> 1 nuke
+		if (n == 27) {
+			boolean ok = true;
+			for (byte b : in) {
+				if (b != DYNAMITE) {
+					ok = false;
+					break;
+				}
+			}
+			if (ok) {
+				Craft c = new Craft();
+				c.out[idx(1, 1, 1)] = NUKE;
+				c.name = "Nuke";
+				return c;
 			}
 		}
 		// 8 ores (2x2x2) -> 1 block, 27 ores -> 8 blocks
